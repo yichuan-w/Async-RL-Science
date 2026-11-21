@@ -1,0 +1,24 @@
+[flake8]
+# Only what finds runtime bugs: pyflakes (F: undefined names, unused imports,
+# redefinitions), bugbear (B: likely bugs), torchfix (TOR: deprecated or
+# misused torch APIs). Formatting and naming are nobody's business here.
+select = F,B,B9,TOR0,TOR1,TOR2
+ignore =
+    # star-import names and the names they may shadow; too noisy on this tree
+    F405,
+    # unused local variables are not bugs
+    F841,
+    # bugbear opinions, not bugs: unused loop variables, calls in argument defaults
+    B007,B008,
+    # bugbear's line-length opinion (B9 stays selected: without it the plugin crashes)
+    B950,
+exclude =
+    ./.git,
+    ./docs
+    ./build
+    ./scripts,
+    ./venv,
+    *.pyi
+    .pre-commit-config.yaml
+    *.md
+    .flake8

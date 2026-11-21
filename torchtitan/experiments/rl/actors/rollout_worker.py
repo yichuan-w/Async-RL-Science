@@ -1,0 +1,316 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""RolloutWorker: runs group rollouts in its own process, off the controller's GIL.
+
+The controller's single event loop otherwise drives every rollout's agent
+orchestration -- a multi-turn agent loop, any API->generate shim, sandbox HTTP
+clients, and grading -- so at high rollout concurrency the GIL
+serializes that per-turn Python and caps throughput regardless of how many
+sandboxes or generators are available.
+
+This actor moves ``run_group_rollouts`` into a pool of CPU worker processes
+(co-located on the generator hosts). Each worker owns its own ``Rollouter``
+(with a local 127.0.0.1 shim on a per-worker port), ``Renderer``, and a
+generate-only generator router. The controller pins rollout-loop lanes to
+workers round-robin, and each lane sends one RPC for whichever group it claims.
+Multiple async ``run_group`` calls overlap inside each worker; ``train.py`` pins
+Monarch's concurrent endpoint dispatch for this behavior. The finalized groups
+return independently, while the off-policy buffer, batcher, trainer, and weight
+sync all stay in the controller.
+
+Only two payloads cross the Monarch RPC boundary: the raw ``sample`` in, and the
+``RolloutGroup`` out (which has to reach the trainer anyway).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import faulthandler
+import logging
+import os
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from typing import TYPE_CHECKING
+
+from monarch.actor import Actor
+
+from torchtitan.experiments.rl.actors.generator import SamplingConfig
+from torchtitan.experiments.rl.actors.monarch_compat import endpoint
+from torchtitan.experiments.rl.controller_metrics import compute_rollout_metrics
+from torchtitan.experiments.rl.rollout import RolloutGroup
+from torchtitan.experiments.rl.rollout.rollouter import Rollouter
+from torchtitan.experiments.rl.rollout.types import GenerateFn
+from torchtitan.experiments.rl.routing.inter_generator_router import (
+    InterGeneratorRouter,
+)
+from torchtitan.experiments.rl.routing.types import RoutingContext
+from torchtitan.observability import structured_logger as sl
+
+if TYPE_CHECKING:
+    from torchtitan.experiments.rl.controller import Controller
+
+
+def _enable_worker_info_logging() -> None:
+    """Let this worker's INFO records reach the controller.
+
+    Monarch forwards a worker's output to the controller, but this process configures
+    no handler, so records fall through to ``logging.lastResort`` -- a stderr handler
+    pinned at WARNING. Every ``logger.info`` on the rollout path is dropped as a
+    result, including the agent loop's per-rollout "finished after N turns
+    (finish=...)" line, which is the only place a rollout's stop reason is stated.
+    (Confirmed from a run's log: worker WARNING/exception records appear, worker INFO
+    records never do, and the ones that appear carry no ``init_logger`` formatting.)
+
+    Scope the fix to the ``torchtitan`` logger rather than the root, so third-party
+    libraries stay muted, and only attach a handler when nothing upstream provides
+    one -- attaching unconditionally duplicates every line in a process that already
+    configured logging.
+
+    ``TT_ROLLOUT_LOG_LEVEL=DEBUG`` additionally turns on the per-turn records (prompt
+    length, the turn's max_tokens, output length, finish reason), which is how to tell
+    whether turns are hitting the per-turn generation cap. Default INFO keeps it to
+    one line per rollout.
+    """
+    level = getattr(
+        logging, os.environ.get("TT_ROLLOUT_LOG_LEVEL", "INFO").upper(), logging.INFO
+    )
+    logger = logging.getLogger("torchtitan")
+    logger.setLevel(level)
+    if not logger.hasHandlers():
+        handler = logging.StreamHandler()
+        handler.setLevel(level)
+        logger.addHandler(handler)
+
+
+class RolloutWorker(Actor):
+    """One CPU process that runs group rollouts off the controller's GIL.
+
+    Spawned as its own 1-proc mesh, co-located with the generators. ``setup``
+    hands it the shared generator actor refs so it can build its own generate
+    router; each ``run_group`` call runs + scores one prompt group and returns
+    the ``RolloutGroup``.
+
+    Args:
+        config: The controller config (its ``renderer``, ``rollouter``,
+            ``generator``, ``generator_router``, ``async_loop``, and
+            ``hf_assets_path`` fields are reused verbatim so a worker's rollouts
+            are identical to the in-controller path).
+        rollout_concurrency: This worker's own rollout-concurrency cap (the
+            controller splits the global ``rollout_concurrency`` target across the
+            pool). Set into the rollouter Config (via replace) before build, so each
+            worker process caps its own concurrent rollouts from config -- not env.
+    """
+
+    def __init__(
+        self,
+        config: "Controller.Config",
+        *,
+        rollout_concurrency: int,
+        artifact_attempt_id: str = "",
+    ) -> None:
+        _enable_worker_info_logging()
+        if artifact_attempt_id:
+            os.environ["TRL_ROLLOUT_ATTEMPT_ID"] = artifact_attempt_id
+        # aiohttp with trust_env=True (e.g. a sandbox SDK) reads $NETRC, else ~/.netrc,
+        # on every request. With HOME on NFS and no such file, ~1000+ concurrent
+        # sessions turn that one negative lookup into kernel lock contention: 89%
+        # system CPU and 16.8 s per sandbox exec on one B300 node. Nothing a
+        # rollout calls authenticates through netrc, and W&B logs from the
+        # controller, not here. An explicit NETRC still wins.
+        os.environ.setdefault("NETRC", os.devnull)
+        self.config = config
+        self.renderer = config.renderer.build(tokenizer_path=config.hf_assets_path)
+        # Same sampling config the controller builds (seed + renderer stop tokens);
+        # the rollouter offsets the seed per sample.
+        self._sampling = replace(
+            config.generator.sampling,
+            seed=config.generator.debug.seed,
+            stop_token_ids=list(self.renderer.get_stop_token_ids()),
+        )
+        # Per-worker concurrency: override the rollouter's rollout_concurrency with
+        # this worker's exact share of the global limit, so the rollouter builds its
+        # semaphore from config -- no process-wide env. The hasattr guard keeps the
+        # pool usable with any Rollouter.Config.
+        rollouter_config = config.rollouter
+        if hasattr(rollouter_config, "rollout_concurrency"):
+            rollouter_config = replace(
+                rollouter_config, rollout_concurrency=rollout_concurrency
+            )
+        self._rollouter: Rollouter = rollouter_config.build()
+        self._generator_router: InterGeneratorRouter | None = None
+        self._stall_dump_path = ""
+        self._stall_watch: asyncio.Task | None = None
+
+    def _start_stall_dump(self) -> None:
+        """Write every thread's stack to a local file if this loop stalls.
+
+        faulthandler's timer runs on its own C thread, so the dump lands even
+        when the event loop or the GIL is stuck; the loop re-arms it while
+        healthy. The file sits on the controller host (workers are spawned
+        there), where the controller reads it when a ping goes unanswered --
+        nothing goes through log forwarding, which may be what is stuck.
+        """
+        stall_dir = os.path.join(tempfile.gettempdir(), "torchtitan_worker_stalls")
+        os.makedirs(stall_dir, exist_ok=True)
+        self._stall_dump_path = os.path.join(stall_dir, f"{os.getpid()}.txt")
+        # Unbuffered: faulthandler writes the fd directly from its own thread.
+        dump_file = open(self._stall_dump_path, "w+b", buffering=0)  # noqa: SIM115
+        fd = dump_file.fileno()
+        # Dump before the controller's ping deadline, so the stacks are there to read.
+        dump_after = 0.75 * self.config.rollout_worker_ping_timeout_sec
+        rearm_every = min(30.0, dump_after / 3)
+        log = logging.getLogger("torchtitan")
+
+        async def rearm() -> None:
+            while True:
+                faulthandler.dump_traceback_later(
+                    dump_after, repeat=True, file=dump_file
+                )
+                await asyncio.sleep(rearm_every)
+                size = os.fstat(fd).st_size
+                if size:
+                    # A stall that ended: report it and start the file over.
+                    stacks = os.pread(fd, min(size, 64 * 1024), max(0, size - 64 * 1024))
+                    log.warning(
+                        f"[rollout_worker] event loop stalled over {dump_after:.0f}s; "
+                        f"stacks:\n{stacks.decode('utf-8', errors='replace')}"
+                    )
+                    os.ftruncate(fd, 0)
+                    os.lseek(fd, 0, os.SEEK_SET)
+
+        self._stall_watch = asyncio.create_task(rearm())
+
+    @endpoint
+    async def ping(self) -> str:
+        """Answer the controller's liveness check with this worker's stall-dump path."""
+        return self._stall_dump_path
+
+    @endpoint
+    async def setup(self, generators: list) -> None:
+        """Build this worker's generate-only router over the shared generator actors."""
+        # Renderer thread pool: render work is CPU-bound, so size to CPU count (decoupled from rollout concurrency).
+        #
+        # ``Controller.setup_async`` installs exactly this, but on the
+        # CONTROLLER's loop. Rollouts do not run there: this actor moves ``run_group_rollouts``
+        # into a pool of CPU worker processes (module docstring above), and a worker never runs
+        # ``setup_async``, so without this line it keeps asyncio's stock ``min(32, cpu+4)``.
+        #
+        # Three things in THIS process post to that one executor:
+        #   * the renderer, per turn
+        #   * a sandbox SDK's blocking uploads (run_in_executor(None, ...)), if the
+        #     rollouter uses one
+        #   * aiohttp's ThreadedResolver, which resolves DNS on the default executor when
+        #     aiodns is not installed
+        # These can contend at high concurrency. Increasing this shared pool can
+        # reduce DNS queueing; it does not isolate DNS or guarantee no timeouts.
+        loop = asyncio.get_running_loop()
+        cpu_count = os.cpu_count()
+        stock = min(32, (cpu_count or 1) + 4)
+        before = getattr(getattr(loop, "_default_executor", None), "_max_workers", None)
+        executor = ThreadPoolExecutor(max_workers=cpu_count)
+        loop.set_default_executor(executor)
+        logging.getLogger("torchtitan").info(
+            "[rollout_worker] default executor max_workers: installed=%s (was %s; asyncio "
+            "would default to %s) cpu_count=%s",
+            executor._max_workers,
+            before,
+            stock,
+            cpu_count,
+        )
+        self._generator_router = self.config.generator_router.build(
+            generators=generators
+        )
+        self._start_stall_dump()
+
+    @endpoint
+    async def run_group(
+        self,
+        *,
+        sample: object,
+        group_id: int,
+        group_size: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
+        metrics_prefix: str | None = "rollout",
+    ) -> RolloutGroup:
+        """Run + score one prompt group; return the finalized RolloutGroup.
+
+        Args:
+            group_size: Sibling rollouts for this group. None uses the training
+                ``async_loop.group_size``; a validation pass passes its own k.
+            temperature: Sampling temperature override (None keeps the training value).
+            top_p: Nucleus sampling override (None keeps the training value).
+            max_tokens: Per-generation token cap override (None keeps the training value).
+            metrics_prefix: Prefix for the standard computed rollout metrics. None
+                skips them, leaving only the rollouter's own group metrics -- the
+                validation path re-keys and aggregates those in the controller.
+        """
+        if self._generator_router is None:
+            raise RuntimeError("RolloutWorker.run_group called before setup()")
+        sampling = self._sampling
+        if temperature is not None:
+            sampling = replace(sampling, temperature=temperature)
+        if top_p is not None:
+            sampling = replace(sampling, top_p=top_p)
+        if max_tokens is not None:
+            sampling = replace(sampling, max_tokens=max_tokens)
+        with sl.log_trace_span("worker_run_group"):
+            generate_fn = self._make_generate_fn()
+            group = await self._rollouter.run_group_rollouts(
+                generate_fn=generate_fn,
+                sample=sample,
+                group_id=group_id,
+                group_size=(
+                    self.config.async_loop.group_size
+                    if group_size is None
+                    else group_size
+                ),
+                sampling=sampling,
+                renderer=self.renderer,
+            )
+            # Preserve rollouter-set group metrics (e.g. format_errors); append the standard computed ones, don't overwrite.
+            if metrics_prefix is not None:
+                group.metrics = compute_rollout_metrics(
+                    prefix=metrics_prefix, rollouts=group.rollouts
+                ) + list(group.metrics)
+        return group
+
+    def _make_generate_fn(self) -> GenerateFn:
+        """Route a completion through this worker's generator router.
+
+        Mirror of ``Controller._make_generate_fn`` (generate path only): sticky
+        routing on ``routing_session_id`` keeps a sample's turns on one
+        generator for prefix-KV reuse.
+        """
+        router = self._generator_router
+
+        @sl.log_trace_span("generate")
+        async def generate(
+            prompt_token_ids: list[int],
+            *,
+            request_id: str,
+            routing_session_id: str | None = None,
+            sampling_config: SamplingConfig | None = None,
+        ):
+            result = await router.route(
+                "generate",
+                prompt_token_ids,
+                request_id=request_id,
+                routing_session_id=routing_session_id,
+                sampling_config=sampling_config,
+                metrics_prefix="generator",
+                routing_ctx=RoutingContext(
+                    estimated_cost=1,
+                    session_id=routing_session_id,
+                ),
+            )
+            # route returns a per-rank ValueMesh; all ranks return the same value.
+            return result.get(0)
+
+        return generate

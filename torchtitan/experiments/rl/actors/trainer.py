@@ -1,0 +1,1074 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import contextlib
+import logging
+import math
+import os
+import pickle
+import re
+import shutil
+import threading
+import time
+from dataclasses import dataclass, field, replace
+from typing import Any
+
+import torch
+import torchstore as ts
+from monarch.actor import Actor, current_rank
+from torch.distributed.checkpoint.api import CheckpointException
+from torch.distributed.tensor import DTensor
+from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.checkpoint_utils import canonical_fqn
+from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.config import (
+    apply_overrides,
+    CommConfig,
+    CompileConfig,
+    Configurable,
+    DebugConfig,
+    OverrideConfig,
+    ParallelismConfig,
+    TORCH_DTYPE_MAP,
+    TrainingConfig,
+)
+from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.distributed.activation_checkpoint import (
+    ActivationCheckpointingConfig,
+    SelectiveAC,
+)
+from torchtitan.distributed.utils import set_batch_invariance
+from torchtitan.experiments.rl.actors.monarch_compat import endpoint
+from torchtitan.experiments.rl.losses import GRPOLoss
+from torchtitan.experiments.rl.types import OptimStepOutput, TrainingMicrobatch
+from torchtitan.models.common.attention import FlexAttention
+from torchtitan.tools.profiler import PROFILE_DIR, PROFILE_FILE
+from torchtitan.observability import structured_logger as sl
+from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.tools import utils
+from torchtitan.tools.logging import init_logger
+
+logger = logging.getLogger(__name__)
+
+
+def _cast_state_dict_parameters_for_transfer(
+    state_dict: dict[str, torch.Tensor],
+    model: torch.nn.Module,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """Cast floating parameters while preserving persistent buffer dtypes."""
+    buffer_names = {
+        canonical_fqn(name) for name, _ in model.named_buffers(remove_duplicate=False)
+    }
+    transferred: dict[str, torch.Tensor] = {}
+    for name, tensor in state_dict.items():
+        if canonical_fqn(name) in buffer_names or not tensor.is_floating_point():
+            transferred[name] = tensor
+            continue
+
+        if isinstance(tensor, DTensor) and tensor.to_local().numel() == 0:
+            local_tensor = tensor.to_local()
+            cast_local_tensor = torch.empty_strided(
+                local_tensor.shape,
+                local_tensor.stride(),
+                dtype=dtype,
+                device=local_tensor.device,
+            )
+            transferred[name] = DTensor.from_local(
+                cast_local_tensor,
+                tensor.device_mesh,
+                tensor.placements,
+                run_check=False,
+                shape=tensor.shape,
+                stride=tensor.stride(),
+            )
+        else:
+            transferred[name] = tensor.to(dtype)
+    return transferred
+
+
+class _MicrobatchProfiler:
+    """Kineto profile of N consecutive forward_backward microbatches.
+
+    torchtitan's ``tools/profiler.Profiler`` is driven by a per-*step* training
+    loop; the RL trainer is an actor whose unit of work is a microbatch, so this
+    wraps the same ``torch.profiler`` with a microbatch counter instead.
+
+    Off unless ``RL_PROFILE_MICROBATCHES`` is set. ``RL_PROFILE_SKIP``
+    microbatches run first so the profile misses cold-start allocation and the
+    first FSDP all-gather. Ranks each write their own trace; the op table is also
+    logged so the hot kernels are readable without opening the trace.
+    """
+
+    def __init__(self, dump_folder: str, rank: int) -> None:
+        self.count = int(os.environ.get("RL_PROFILE_MICROBATCHES", "0"))
+        self.skip = int(os.environ.get("RL_PROFILE_SKIP", "3"))
+        self.dump_folder = dump_folder
+        self.rank = rank
+        self._seen = 0
+        self._prof: Any = None
+        self._done = False
+        if self.count:
+            logger.info(
+                f"[trainer] profiler armed: skip {self.skip} microbatch(es), "
+                f"then capture {self.count}"
+            )
+
+    @contextlib.contextmanager
+    def maybe_profile(self):
+        if not self.count or self._done:
+            yield
+            return
+        if self._seen == self.skip:
+            # with_stack attributes kernels back to the Python frame, which is
+            # what separates the GDN layers from the softmax layers and the
+            # lm_head; it costs a few seconds per microbatch and this path runs
+            # for `count` microbatches only.
+            self._prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                with_stack=True,
+            )
+            self._prof.start()
+            logger.info(f"[trainer] profiler START at microbatch {self._seen}")
+        self._seen += 1
+        try:
+            yield
+        finally:
+            if self._prof is not None and self._seen >= self.skip + self.count:
+                self._prof.stop()
+                self._export(self._prof)
+                self._prof = None
+                self._done = True
+
+    def _export(self, prof: Any) -> None:
+        out_dir = os.path.join(self.dump_folder, PROFILE_DIR)
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, PROFILE_FILE.format(rank=self.rank))
+        try:
+            prof.export_chrome_trace(path)
+            logger.info(f"[trainer] profiler trace written to {path}")
+        except Exception as exc:  # a failed export must not kill the run
+            logger.warning(f"[trainer] profiler export failed: {exc}")
+        for key in ("self_cuda_time_total", "self_cpu_time_total"):
+            try:
+                table = prof.key_averages().table(sort_by=key, row_limit=25)
+            except Exception as exc:
+                logger.warning(f"[trainer] profiler table ({key}) failed: {exc}")
+                continue
+            logger.info(f"[trainer] profiler top ops by {key}:\n{table}")
+
+
+def _pin_new_threads_to_device(device: torch.device) -> None:
+    """Make Python threads started from now on use this rank's GPU.
+
+    The CUDA current device is per thread. Every trainer process sees all eight
+    GPUs, so a helper thread (DCP/HF loader pools, asyncio.to_thread, ...) that
+    touches CUDA without set_device opens a ~0.5 GiB context on GPU 0: 7 ranks x
+    ~0.55 GiB is the ~4 GiB extra measured on local rank 0. Opt in with
+    RL_PIN_THREAD_DEVICE=1. Threads created outside Python (Rust/C++) are not covered.
+    """
+    if os.environ.get("RL_PIN_THREAD_DEVICE", "0") != "1":
+        return
+    bootstrap = threading.Thread._bootstrap_inner  # pyrefly: ignore [missing-attribute]
+
+    def _bootstrap_on_device(thread: threading.Thread) -> None:
+        torch.cuda.set_device(device)
+        bootstrap(thread)
+
+    threading.Thread._bootstrap_inner = (  # pyrefly: ignore [missing-attribute]
+        _bootstrap_on_device
+    )
+
+
+def _mem_log(tag: str) -> None:
+    """RL_TRAINER_MEM_LOG=1: print this rank's CUDA memory (every rank, not just
+    the host's logging rank), to find the rank that runs out first."""
+    if os.environ.get("RL_TRAINER_MEM_LOG", "0") != "1":
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    gib = 1 << 30
+    free, total = torch.cuda.mem_get_info()
+    print(
+        f"[trainer-mem] rank={rank} {tag}: "
+        f"alloc={torch.cuda.memory_allocated() / gib:.1f} "
+        f"reserved={torch.cuda.memory_reserved() / gib:.1f} "
+        f"peak={torch.cuda.max_memory_allocated() / gib:.1f} "
+        f"device_used={(total - free) / gib:.1f}/{total / gib:.0f} GiB "
+        f"retries={torch.cuda.memory_stats().get('num_alloc_retries', 0)}",
+        flush=True,
+    )
+
+
+def _maybe_regional_compile(model: torch.nn.Module) -> None:
+    """RL_TRAINER_REGIONAL_COMPILE=1: torch.compile each block's feed-forward and
+    norms, leaving attention and GatedDeltaNet eager. Whole-block compile fails on
+    fla's causal_conv1d inside the activation-checkpoint region; these submodules
+    hold most of the unfused elementwise work (~9% of a 9B microbatch)."""
+    if os.environ.get("RL_TRAINER_REGIONAL_COMPILE", "0") != "1":
+        return
+    torch._dynamo.config.capture_scalar_outputs = True
+    torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
+    compiled = 0
+    # RL_TRAINER_REGIONAL_COMPILE_WIDE=1 also compiles the norms inside attention:
+    # GatedDeltaNet's output RMSNormGated (attn.norm), softmax attention's q/k
+    # norms, and the final norm.
+    wide = os.environ.get("RL_TRAINER_REGIONAL_COMPILE_WIDE", "0") == "1"
+    for block in model.layers.children():
+        inner = getattr(block, "_checkpoint_wrapped_module", block)
+        subs = [getattr(inner, n, None) for n in ("feed_forward", "attention_norm", "ffn_norm")]
+        if wide:
+            attn = getattr(inner, "attn", None)
+            subs += [getattr(attn, n, None) for n in ("norm", "q_norm", "k_norm")]
+        for sub in subs:
+            if sub is not None:
+                sub.compile(backend="inductor", fullgraph=True)
+                compiled += 1
+    if wide and getattr(model, "norm", None) is not None:
+        model.norm.compile(backend="inductor", fullgraph=True)
+        compiled += 1
+    logger.info(f"[trainer] regional compile: {compiled} feed-forward/norm modules")
+
+
+def _keep_milestone_checkpoints(checkpointer: CheckpointManager, every: int) -> None:
+    """Make ``checkpointer`` skip steps that are multiples of ``every`` when purging.
+
+    Same selection as ``CheckpointManager._purge_stale_checkpoints`` (keep the
+    newest ``keep_latest_k``), except milestone steps are never queued.
+    """
+
+    def purge() -> None:
+        if not checkpointer._should_purge():
+            return
+        found = []
+        for name in os.listdir(checkpointer.folder):
+            match = re.search(r"step-(\d+)", name)
+            if match:
+                found.append((int(match.group(1)), os.path.join(checkpointer.folder, name)))
+        found.sort()
+        for step, path in found[: -checkpointer.keep_latest_k]:
+            if step % every != 0:
+                checkpointer.purge_queue.put(path)
+
+    checkpointer._purge_stale_checkpoints = purge
+
+
+class PolicyTrainer(Actor, Configurable):
+    """Updates policy based on collected TrainingSample using TorchTitan components.
+
+    Exposes separate `forward_backward` and `optim_step` endpoints, called
+    explicitly by the controller.
+
+    Args:
+        config: PolicyTrainer.Config with all model/optimizer/parallelism settings.
+        model_spec: TorchTitan model specification.
+        hf_assets_path: Path to HF assets folder for checkpoint loading.
+            Shared with the generator (both load from the same HF checkpoint).
+        generator_dtype: Generator dtype (e.g. "bfloat16"). Needed to cast weights to generator dtype
+            if generator dtype differs from training dtype. If None, no cast is performed.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        """PolicyTrainer configuration for optimizer, training, and parallelism."""
+
+        optimizer: OptimizersContainer.Config = field(
+            default_factory=OptimizersContainer.Config
+        )
+        lr_scheduler: LRSchedulersContainer.Config = field(
+            default_factory=LRSchedulersContainer.Config
+        )
+        training: TrainingConfig = field(default_factory=TrainingConfig)
+        parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
+        comm: CommConfig = field(default_factory=CommConfig)
+        debug: DebugConfig = field(default_factory=DebugConfig)
+        loss: BaseLoss.Config = field(default_factory=GRPOLoss.Config)
+        ac_config: ActivationCheckpointingConfig = field(
+            default_factory=SelectiveAC.Config
+        )
+        checkpoint: CheckpointManager.Config = field(
+            default_factory=CheckpointManager.Config
+        )
+        override: OverrideConfig = field(default_factory=OverrideConfig)
+        """Config overrides (e.g. ``torchtitan.overrides.fused_swiglu``) applied to
+        this trainer's model spec after ``update_from_config`` and before build.
+        Separate from the generator's override so the two can differ."""
+        dump_folder: str = ""
+        """Folder for AC debug dumps when using memory_budget mode."""
+
+        initial_policy_version: int = 0
+        """Starting version for an explicit model-only warm start; optimizer state is fresh."""
+
+        checkpoint_training_data: bool = False
+        """Include controller dataset state and pending prompts in full checkpoints."""
+
+        checkpoint_keep_every: int = 0
+        """Never purge checkpoints whose step is a multiple of this (0 = off).
+
+        ``checkpoint.keep_latest_k`` still bounds the rolling resume copies;
+        these milestone steps are kept on top of them, e.g. for later eval."""
+
+        skip_zero_grad_step: bool = False
+        """Skip the optimizer step when the all-reduced grad norm is exactly 0.0.
+
+        A step whose every sample has zero advantage backprops exact zeros, but
+        AdamW still moves the weights on it: the moment estimates from earlier
+        steps keep producing an update. Off keeps the historical behaviour; the
+        LR scheduler and ``policy_version`` advance either way."""
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        model_spec: ModelSpec,
+        compile_config: CompileConfig,
+        hf_assets_path: str = "",
+        generator_dtype: str = "",
+        output_dir: str,
+    ):
+        init_logger()
+        if not config.dump_folder:
+            config.dump_folder = output_dir
+        sl.init_structured_logger(
+            source="rl_trainer",
+            output_dir=output_dir,
+            rank=current_rank().rank,
+            enable=config.debug.enable_structured_logging,
+        )
+        sl.log_trace_instant("structured_logger_started")
+
+        # RL_LMHEAD_TF32=1: run the trainer's fp32 matmuls (in practice only the
+        # CastLinear lm_head -- the decoder body is bf16) with TF32 tensor cores.
+        # CastLinear exists to avoid rounding each OUTPUT logit to bf16; TF32 keeps
+        # fp32 accumulation and fp32 outputs and only rounds matmul INPUTS to a
+        # 10-bit mantissa. Measured motive: the chunked DPPO loss runs ~400 TFLOP
+        # of fp32 lm_head fwd+bwd per 65536-token microbatch, which at B300's
+        # non-tensor-core fp32 rate is ~9s of the 24s microbatch. Scoped to the
+        # trainer process; generators are separate actor processes.
+        if os.environ.get("RL_LMHEAD_TF32", "0") == "1":
+            try:
+                torch.backends.cuda.matmul.fp32_precision = "tf32"
+            except (AttributeError, ValueError):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            logger.info("[trainer] TF32 enabled for fp32 matmuls (RL_LMHEAD_TF32=1)")
+
+        self.config = config
+        self.compile_config = compile_config
+        self._profiler = _MicrobatchProfiler(config.dump_folder, current_rank().rank)
+        self.loss_fn = config.loss.build()
+        # TODO: add support to compile the loss.
+
+        # Only cast if generator dtype differs from training dtype, otherwise
+        # staging buffers would be allocated for a no-op cast.
+        training_dtype = TORCH_DTYPE_MAP[config.training.dtype]
+        gen_dtype = TORCH_DTYPE_MAP[generator_dtype] if generator_dtype else None
+        self._transfer_dtype = gen_dtype if gen_dtype != training_dtype else None
+        # RL_SKIP_FROZEN_WEIGHT_SYNC=1: push frozen params (the vision tower) only
+        # on the first push; they never change, and each one costs a TorchStore
+        # request per FSDP shard on every generator pull.
+        self._skip_frozen_sync = os.environ.get("RL_SKIP_FROZEN_WEIGHT_SYNC") == "1"
+        self._pushed_once = False
+        self._logged_frozen_skip = False
+
+        # Device setup
+        device_module, device_type = utils.device_module, utils.device_type
+        self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
+        device_module.set_device(self.device)
+        _pin_new_threads_to_device(self.device)
+
+        # Enable batch-invariant mode BEFORE init_distributed
+        set_batch_invariance(config.debug.batch_invariant)
+
+        with sl.log_trace_span("torch_distributed_init"):
+            world_size = dist_utils.init_distributed(
+                config.comm,
+                base_folder=output_dir,
+            )
+
+        self.parallel_dims = ParallelDims.from_config(config.parallelism, world_size)
+
+        # Set determinism flags and seed via core torchtitan utility
+        dist_utils.set_determinism(
+            self.parallel_dims,
+            self.device,
+            config.debug,
+            distinct_seed_mesh_dims=["pp"],
+        )
+
+        # Initialize state dict adapter for HF checkpoint loading
+        if model_spec.state_dict_adapter is not None:
+            self.sd_adapter = model_spec.state_dict_adapter(
+                model_spec.model, hf_assets_path
+            )
+        else:
+            self.sd_adapter = None
+
+        # Create training policy model
+        model = self._build_model(model_spec, config, device_type)
+        model.train()
+        self.model = model
+        self.model_parts = [model]
+
+        # Freeze the multimodal vision tower for text-only RL. RL rollouts carry no
+        # pixel_values, so the vision encoder never forwards and its params never
+        # receive gradients. Left trainable they still enter the optimizer, but Adam
+        # never steps them -> their optimizer state lacks the per-param "step" entry,
+        # which trips DCP's strict state_dict check on the interval checkpoint save
+        # ("Missing key in checkpoint state_dict: optimizer.state.vision_encoder.
+        # pos_embed.step") and kills the trainer. Freezing excludes them from the
+        # optimizer (build filters on requires_grad); the frozen weights still
+        # save/load as plain model state. No-op for text-only models.
+        num_frozen = 0
+        for part in self.model_parts:
+            vision = getattr(part, "vision_encoder", None)
+            if vision is not None:
+                for p in vision.parameters():
+                    if p.requires_grad:
+                        p.requires_grad_(False)
+                        num_frozen += 1
+        if num_frozen:
+            logger.info(
+                f"Froze {num_frozen} vision_encoder params (text-only RL; excluded "
+                "from optimizer + DCP optimizer state)."
+            )
+
+        if isinstance(self.loss_fn, ChunkedLossWrapper):
+            lm_head = model.lm_head
+            assert lm_head is not None, "Model must have lm_head for ChunkedLossWrapper"
+            self.loss_fn.set_lm_head(lm_head)
+            model._skip_lm_head = True
+
+        # Build optimizer and LR scheduler
+        self.optimizers = config.optimizer.build(model_parts=self.model_parts)
+        self.lr_schedulers = config.lr_scheduler.build(
+            optimizers=self.optimizers,
+            training_steps=config.training.steps,
+        )
+
+        if config.initial_policy_version < 0:
+            raise ValueError("initial_policy_version must be nonnegative")
+        if config.initial_policy_version and not (
+            config.checkpoint.enable
+            and config.checkpoint.initial_load_path
+            and config.checkpoint.initial_load_model_only
+        ):
+            raise ValueError(
+                "initial_policy_version requires an enabled model-only initial checkpoint"
+            )
+        self.policy_version = config.initial_policy_version
+        self._controller_training_data = b""
+
+        self._failed_saves = 0
+        self._pending_save_step: int | None = None
+        # Always build CheckpointManager; enable is a field on the config.
+        # When enable=False (CI/debug), load() is a no-op and random init stands.
+        self.checkpointer = config.checkpoint.build(
+            dataloader=None,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states={"train_state": self},
+            sd_adapter=self.sd_adapter,
+            base_folder=config.dump_folder,
+        )
+        if config.checkpoint_keep_every > 0:
+            _keep_milestone_checkpoints(self.checkpointer, config.checkpoint_keep_every)
+        self.checkpointer.load()
+        # A model-only initial load leaves policy_version at the initial value; a
+        # resume from this run's own checkpoint restores a later one.
+        if config.initial_policy_version and self.policy_version < config.initial_policy_version:
+            raise ValueError("Loaded training state disagrees with initial_policy_version")
+        if not self.checkpointer.enable:
+            logger.warning(
+                "Checkpoint disabled, skip weight loading and use random-initialized weights. "
+                "Set checkpoint.enable=True to load from a checkpoint."
+            )
+
+        self.generator: Any | None = None
+
+        # Data parallelism: mesh is available after _build_model triggers build_mesh
+        self.dp_enabled = self.parallel_dims.dp_enabled
+        batch_mesh = self.parallel_dims.get_optional_mesh("batch")
+        if batch_mesh is not None:
+            self.dp_size = batch_mesh.size()
+            self.dp_rank = batch_mesh.get_local_rank()
+        else:
+            self.dp_size = 1
+            self.dp_rank = 0
+
+        # RL_TRAINER_RESERVE_GB=N: grow this rank's cached GPU memory to N GiB now, at
+        # startup. The trainer otherwise reaches its peak only in the first backward,
+        # and on a GPU shared with other users a process that arrives in between can
+        # take that memory (a benchmark run lost three resumes this way).
+        # Nothing here calls empty_cache, so the freed block stays in the caching
+        # allocator and later steps reuse it. 0 (default) reserves nothing.
+        reserve_gib = float(os.environ.get("RL_TRAINER_RESERVE_GB", "0") or 0)
+        if reserve_gib > 0 and self.device.type == "cuda":
+            gib = 1 << 30
+            missing = int(reserve_gib * gib) - torch.cuda.memory_reserved(self.device)
+            if missing > 0:
+                block = torch.empty(missing, dtype=torch.uint8, device=self.device)
+                del block
+            logger.info(
+                f"[trainer] dp_rank={self.dp_rank}: reserved "
+                f"{torch.cuda.memory_reserved(self.device) / gib:.1f} GiB at startup "
+                f"(RL_TRAINER_RESERVE_GB={reserve_gib:g})"
+            )
+
+        logger.debug(
+            f"PolicyTrainer initialized (dp_rank={self.dp_rank}, dp_size={self.dp_size})"
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        # Checkpoint "train_state": policy_version == completed optim steps, so it
+        # doubles as the resume step counter.
+        state: dict[str, Any] = {"policy_version": self.policy_version}
+        if self.config.checkpoint_training_data:
+            # An opaque byte payload lets DCP load variable-size prompt queues;
+            # an empty nested dict would not allocate their saved keys on load.
+            state["controller_training_data"] = self._controller_training_data
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.policy_version = state_dict["policy_version"]
+        if self.config.checkpoint_training_data:
+            self._controller_training_data = state_dict["controller_training_data"]
+
+    def _select_local_microbatch(
+        self, training_data: list[TrainingMicrobatch]
+    ) -> TrainingMicrobatch:
+        """This rank's microbatch: from a full ``[dp_degree]`` row, or the single
+        microbatch the controller sent to this DP rank alone."""
+        if len(training_data) == self.dp_size:
+            return training_data[self.dp_rank]
+        if len(training_data) == 1:
+            return training_data[0]
+        raise ValueError(
+            f"forward_backward got {len(training_data)} microbatches; expected "
+            f"{self.dp_size} (one per DP rank) or 1 (this rank's own)"
+        )
+
+    @endpoint
+    async def get_policy_version(self) -> int:
+        """Current policy version: after load(), the step a resume restored from
+        (0 if fresh). The controller uses it to resume and re-sync generators."""
+        return self.policy_version
+
+    @endpoint
+    async def get_dp_rank(self) -> int:
+        """This rank's data-parallel rank; the controller checks its per-DP-rank
+        mesh slices against it before sending each rank only its microbatch."""
+        return self.dp_rank
+
+    @endpoint
+    async def get_training_data_state(self) -> bytes:
+        """Return the controller snapshot loaded with this policy and optimizer."""
+        return self._controller_training_data
+
+    @endpoint
+    async def should_save_checkpoint(self, step: int, last_step: bool = False) -> bool:
+        return self.checkpointer._should_save(step, last_step=last_step)
+
+    @endpoint
+    async def checkpoint_save_policy(self) -> dict[str, bool | int]:
+        """The inputs of ``CheckpointManager._should_save``, so the controller can
+        skip the save RPCs on steps that cannot save (see ``checkpoint_saves``)."""
+        checkpointer = self.checkpointer
+        if not checkpointer.enable or checkpointer.load_only:
+            return {"enabled": False, "first_step": False, "interval": 0}
+        return {
+            "enabled": True,
+            "first_step": checkpointer.enable_first_step_checkpoint,
+            "interval": checkpointer.interval,
+        }
+
+    @endpoint
+    async def close(self) -> None:
+        """Close actor-local resources before the process mesh stops.
+
+        The trainer does not own the distributed process group lifecycle here:
+        Monarch created it for the actor mesh, and ``ProcMesh.stop()`` performs
+        the final teardown. Destroying it from this endpoint can race with mesh
+        shutdown and hang at process exit.
+        """
+        logger.debug("PolicyTrainer close requested; ProcMesh.stop owns PG teardown.")
+
+    @sl.log_trace_span("build_model")
+    def _build_model(
+        self,
+        model_spec: ModelSpec,
+        config: Config,
+        device_type: str,
+    ):
+        """Build, parallelize, and initialize a model with random weights.
+
+        Checkpoint loading (e.g. from HF) is handled separately by
+        CheckpointManager after model and optimizer construction.
+
+        Args:
+            model_spec: Model specification for building and parallelizing.
+            config: Trainer config (used for dtype, parallelism, etc.).
+            device_type: Device type string (e.g. "cuda").
+
+        Returns:
+            Model with random-initialized weights.
+        """
+
+        from torchtitan.models.common.attention import VarlenAttention
+
+        # `first_attention` handles hybrid models (linear + full attention): it
+        # returns the first full-attention layer's config, from which attention
+        # masks are derived. A purely-linear model has no full-attention layer.
+        attn_config = model_spec.model.first_attention
+        if attn_config is None:
+            raise ValueError(
+                "RL requires at least one full-attention layer for attention masks."
+            )
+        assert isinstance(
+            attn_config.inner_attention,
+            (VarlenAttention.Config, FlexAttention.Config),
+        ), "Only varlen and flex attention backends are allowed."
+
+        # Fill sharding configs on the config BEFORE build via the
+        # model-agnostic `update_from_config` hook (RL's trainer bypasses
+        # `torchtitan.Trainer's` call, so we invoke it directly).
+        model_spec.model.update_from_config(config=config)
+
+        # Check if seq_length passed the max_seq_len
+        max_seq_len = model_spec.model.max_seq_len
+        seq_len = config.training.seq_len
+        if seq_len > max_seq_len:
+            raise ValueError(
+                f"Training sequence length {seq_len} exceeds "
+                f"attention RoPE maximum supported sequence "
+                f"length {max_seq_len}."
+            )
+
+        for layer_cfg in model_spec.model.layers:
+            attention_cfg = getattr(layer_cfg, "attention", None)
+            if attention_cfg is not None:
+                attention_cfg.rope = replace(attention_cfg.rope, max_seq_len=seq_len)
+
+        # Apply this trainer's config overrides after update_from_config (which
+        # sets the sharding configs the override factories read) and before build
+        if config.override.imports:
+            apply_overrides(config.override, model_spec.model)
+
+        with torch.device("meta"):
+            with utils.set_default_dtype(TORCH_DTYPE_MAP[config.training.dtype]):
+                model = model_spec.model.build()
+
+        model = model_spec.parallelize_fn(
+            model,
+            parallel_dims=self.parallel_dims,
+            training=config.training,
+            parallelism=config.parallelism,
+            compile_config=self.compile_config,
+            ac_config=config.ac_config,
+            dump_folder=config.dump_folder,
+        )
+        _maybe_regional_compile(model)
+
+        model.to_empty(device=device_type)
+        with torch.no_grad():
+            model.init_weights(buffer_device=None)
+
+        return model
+
+    @endpoint
+    async def sync_log_step(self, step: int, relative_step: int | None = None) -> None:
+        """Sync the structured-logger step counter from the controller."""
+        sl.set_step(step, relative_step=relative_step)
+
+    def reduce_forward_backward_metrics(
+        self,
+        *,
+        sum_reduced_metrics: dict[str, torch.Tensor],
+        max_reduced_metrics: dict[str, torch.Tensor],
+    ) -> dict[str, float]:
+        """Reduce forward/backward metrics across the loss mesh.
+
+        Args:
+            sum_reduced_metrics: Per-rank shares to be SUM-reduced. Each
+                value must be pre-normalized so that summing across ranks
+                reconstructs the global metric.
+            max_reduced_metrics: Per-rank values to be MAX-reduced.
+
+        Returns:
+            {key: float} after collective reduction.
+        """
+        # TODO: switch from plain tensors to DTensor / spmd_types so the
+        # reduction op is encoded in the placement instead of split across
+        # `sum_reduced_metrics` / `max_reduced_metrics` dicts.
+        loss_mesh = self.parallel_dims.get_optional_mesh("loss")
+
+        out: dict[str, float] = {
+            key: dist_utils.dist_sum(value.detach(), loss_mesh)
+            for key, value in sum_reduced_metrics.items()
+        }
+        out.update(
+            {
+                key: dist_utils.dist_max(value.detach(), loss_mesh)
+                for key, value in max_reduced_metrics.items()
+            }
+        )
+        return out
+
+    @endpoint
+    @sl.log_trace_span("forward_backward")
+    async def forward_backward(
+        self,
+        training_data: list[TrainingMicrobatch],
+        num_loss_denominator_tokens: int,
+        num_packed_valid_tokens: int | None = None,
+    ) -> dict[str, float]:
+        """Run forward pass, compute loss, call backward, and reduce metrics.
+
+        Args:
+            training_data: List of TrainingMicrobatch, one per DP rank, and the
+                local rank picks training_data[self.dp_rank]; or, when the
+                controller sends each DP rank only its own microbatch, a
+                one-element list holding it.
+            num_loss_denominator_tokens: Loss scale denominator, summed across all
+                DP ranks for this step before sharding (TrainingBatch.
+                num_loss_denominator_tokens): every valid response token by
+                default, or only those of nonzero-advantage samples.
+            num_packed_valid_tokens: Total ACTUALLY-packed valid tokens (excludes
+                zero-advantage samples shed by skip_zero_advantage_samples). Used as
+                the per-trained-token metric denominator; None falls back to
+                num_loss_denominator_tokens.
+
+        Returns:
+            dict[str, float]: Globally-reduced metrics.
+        """
+        # info-level phase logs: the trainer step is otherwise silent until the
+        # controller's end-of-step flush, so a stall inside the first cross-host
+        # FSDP all-gather (model_forward) vs. never entering forward_backward at
+        # all (upstream actor-dispatch stall) is indistinguishable. These pin it.
+        logger.info(
+            f"[trainer] forward_backward ENTER pid={os.getpid()} "
+            f"dp_rank={self.dp_rank} policy_version={self.policy_version}"
+        )
+
+        # RL does not support pipeline parallelism yet, so the trainer
+        # owns one model part.
+        if len(self.model_parts) != 1:
+            raise ValueError(
+                f"PolicyTrainer expects exactly one model part, got "
+                f"{len(self.model_parts)} (pipeline parallelism is not yet "
+                "supported in RL)."
+            )
+        model = self.model_parts[0]
+
+        local_batch = self._select_local_microbatch(training_data)
+        device = self.device
+        token_ids = local_batch.token_ids.to(device)
+        labels = local_batch.labels.to(device)
+        positions = local_batch.positions.to(device)
+        loss_mask = local_batch.loss_mask.to(device)
+        generator_logprobs = local_batch.generator_logprobs.to(device)
+        advantages = local_batch.advantages.to(device)
+        # Sampler top-k for score centering; only losses that take them get them.
+        topk_inputs = {}
+        inner_loss = getattr(self.loss_fn, "loss_fn", self.loss_fn)
+        if local_batch.topk_token_ids is not None and getattr(
+            inner_loss, "accepts_topk", False
+        ):
+            topk_inputs = {
+                "topk_token_ids": local_batch.topk_token_ids.to(device),
+                "topk_logprobs": local_batch.topk_logprobs.to(device),
+            }
+
+        # Per-token policy age (trainer version - sampler version), for losses
+        # whose correction depends on staleness.
+        if local_batch.policy_versions is not None and getattr(
+            inner_loss, "accepts_policy_age", False
+        ):
+            topk_inputs["policy_age"] = (
+                self.policy_version - local_batch.policy_versions.to(device)
+            ).clamp(min=0)
+
+        attention_masks = model.get_attention_masks(positions)
+
+        # Debug: RL_DUMP_BATCH_STEPS=N saves this rank's full packed batch for the
+        # first N policy versions, so trainer-vs-generator logprobs can be re-scored
+        # offline token by token (the max_logdiff dump only keeps 8k chunks).
+        dump_batch = self.policy_version < int(
+            os.environ.get("RL_DUMP_BATCH_STEPS", "0")
+        )
+        if dump_batch:
+            dump_dir = os.path.join(os.environ.get("RL_DUMP_DIR", "/tmp"), "batches")
+            os.makedirs(dump_dir, exist_ok=True)
+            dump_path = os.path.join(
+                dump_dir,
+                f"batch_v{self.policy_version}_r{self.dp_rank}_{time.time_ns()}.pt",
+            )
+            dump = {
+                "token_ids": local_batch.token_ids,
+                "labels": local_batch.labels,
+                "positions": local_batch.positions,
+                "loss_mask": local_batch.loss_mask,
+                "generator_logprobs": local_batch.generator_logprobs,
+                "advantages": local_batch.advantages,
+            }
+
+        # The model forward is where FSDP2 fully_shard issues its unshard
+        # all-gather; under a multi-host dp_shard this is a cross-host collective.
+        logger.info(f"[trainer] dp_rank={self.dp_rank}: model forward start")
+        _mem_log("forward start")
+        with self._profiler.maybe_profile():
+            with sl.log_trace_span("model_forward"), torch.profiler.record_function(
+                "rl_model_forward"
+            ):
+                pred = model(
+                    token_ids, attention_masks=attention_masks, positions=positions
+                )
+            logger.info(f"[trainer] dp_rank={self.dp_rank}: model forward done")
+            _mem_log("forward done")
+            if dump_batch:
+                # With ChunkedLossWrapper the model returns final hidden states (the
+                # lm_head runs inside the loss), so save those: lm_head is re-applied
+                # offline to recover the trainer's logprobs.
+                hidden = pred.to_local() if isinstance(pred, DTensor) else pred
+                dump["hidden"] = hidden.detach().cpu()
+                torch.save(dump, dump_path)
+                logger.info(f"[trainer] dumped batch -> {dump_path}")
+
+            with sl.log_trace_span("loss_fn"), torch.profiler.record_function(
+                "rl_loss_fn"
+            ):
+                loss, loss_metrics = self.loss_fn(
+                    pred,
+                    labels,
+                    num_loss_denominator_tokens,
+                    generator_logprobs=generator_logprobs,
+                    advantages=advantages,
+                    loss_mask=loss_mask,
+                    # Chunked along seq like the other tensors; used only by the
+                    # RL_DEBUG_MAX_LOGDIFF dump to record per-token positions (which
+                    # reset to 0 at each packed-sample boundary).
+                    positions=positions,
+                    # Per-trained-token metric denominator (excludes zero-advantage
+                    # tokens the batch shed); the loss scale uses
+                    # num_loss_denominator_tokens.
+                    metric_denominator=num_packed_valid_tokens,
+                    **topk_inputs,
+                )
+            logger.info(f"[trainer] dp_rank={self.dp_rank}: loss done")
+            _mem_log("loss done")
+
+            with sl.log_trace_span("model_backward"), torch.profiler.record_function(
+                "rl_model_backward"
+            ):
+                loss.backward()
+            logger.info(f"[trainer] dp_rank={self.dp_rank}: backward done")
+            _mem_log("backward done")
+
+        sum_reduced_metrics = {
+            key: value
+            for key, value in loss_metrics.items()
+            if not key.endswith("/max")
+        }
+        max_reduced_metrics = {
+            key: value for key, value in loss_metrics.items() if key.endswith("/max")
+        }
+
+        return self.reduce_forward_backward_metrics(
+            sum_reduced_metrics=sum_reduced_metrics,
+            max_reduced_metrics=max_reduced_metrics,
+        )
+
+    @endpoint
+    @sl.log_trace_span("optim_step")
+    async def optim_step(self) -> OptimStepOutput:
+        """Clip gradients, step optimizer + LR scheduler, return updated state."""
+        # TODO: Accept optional optimizer params (e.g. learning rate)
+        # to allow controller-owned schedules.
+
+        # capture LR before step
+        current_lrs = self.lr_schedulers.schedulers[0].get_last_lr()
+        if len(current_lrs) != 1:
+            raise ValueError(
+                "RL metrics only support a single optimizer LR for "
+                f"train/lr; got {current_lrs}"
+            )
+        current_lr = float(current_lrs[0])
+
+        with sl.log_trace_span("grad_clip"):
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in self.model_parts for p in m.parameters()],
+                self.config.training.max_norm,
+                foreach=True,
+                pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
+                ep_enabled=self.parallel_dims.ep_enabled,
+            )
+
+        # The controller only stops on a non-finite loss; a finite loss can still
+        # backprop inf/NaN, and stepping on it writes NaN into the weights the
+        # generators pull. grad_norm is the all-reduced total, so every rank takes
+        # the same branch. The step is skipped, not the version, so the loop's
+        # bookkeeping is unchanged and the generators re-pull identical weights.
+        grad_norm_value = float(grad_norm.item())
+        skipped_nonfinite = not math.isfinite(grad_norm_value)
+        # Exact zero, no tolerance: a step whose samples all have zero advantage
+        # backprops exact zeros, and anything else is a real (if small) gradient.
+        # Same all-reduced total as above, so every rank agrees.
+        skipped_zero_grad = (
+            self.config.skip_zero_grad_step and grad_norm_value == 0.0
+        )
+        with sl.log_trace_span("optim"):
+            if skipped_nonfinite:
+                logger.warning(
+                    "optim_step: grad_norm=%s is not finite; skipping the "
+                    "optimizer step for policy_version %d",
+                    grad_norm_value,
+                    self.policy_version + 1,
+                )
+            elif skipped_zero_grad:
+                logger.info(
+                    "optim_step: grad_norm is 0.0; skipping the optimizer step "
+                    "for policy_version %d (skip_zero_grad_step)",
+                    self.policy_version + 1,
+                )
+            else:
+                self.optimizers.step()
+            self.lr_schedulers.step()
+            self.optimizers.zero_grad()
+
+        self.policy_version += 1
+
+        logger.debug(
+            f"{os.getpid()=} PolicyTrainer optim_step done, "
+            f"policy_version={self.policy_version}"
+        )
+
+        return OptimStepOutput(
+            policy_version=self.policy_version,
+            metrics={
+                "train/grad_norm/mean": grad_norm_value,
+                "train/skipped_nonfinite_grad": float(skipped_nonfinite),
+                "train/skipped_zero_grad": float(skipped_zero_grad),
+                "train/lr": current_lr,
+                "train/policy_version": float(self.policy_version),
+            },
+        )
+
+    @endpoint
+    @sl.log_trace_span("save_checkpoint")
+    async def save_checkpoint(
+        self,
+        step: int,
+        last_step: bool = False,
+        *,
+        training_data_state: bytes | None = None,
+    ) -> bool:
+        """Save checkpoint via CheckpointManager.
+
+        Args:
+            step: Current training step number.
+            last_step: Whether this is the final step of training.
+
+        Returns:
+            True if a checkpoint was saved.
+        """
+        if self.config.checkpoint_training_data and self.checkpointer._should_save(
+            step, last_step=last_step
+        ):
+            if training_data_state is None:
+                raise ValueError(
+                    "checkpoint_training_data requires a controller snapshot"
+                )
+            snapshot = pickle.loads(training_data_state)
+            if (
+                snapshot["policy_version"] != self.policy_version
+                or step != self.policy_version
+            ):
+                raise ValueError(
+                    "controller data snapshot disagrees with checkpoint policy version"
+                )
+            self._controller_training_data = training_data_state
+        # A storage hiccup (fsync failing on a FUSE mount) used to end the run, and
+        # the step's partial folder would also break the next resume. Drop that
+        # folder and keep training: the previous checkpoint still stands. With
+        # async saves a background write fails at the next save's wait, so that
+        # wait runs first, on its own, to tell whose write failed.
+        should_save = self.checkpointer._should_save(step, last_step=last_step)
+        if should_save and self._pending_save_step is not None:
+            try:
+                self.checkpointer.maybe_wait_for_saving()
+                self._failed_saves = 0
+            except (OSError, CheckpointException) as e:
+                self.checkpointer.save_future = None
+                self._drop_failed_save(self._pending_save_step, e)
+            self._pending_save_step = None
+        try:
+            saved = self.checkpointer.save(step, last_step=last_step)
+        except (OSError, CheckpointException) as e:
+            self.checkpointer.save_future = None
+            self._drop_failed_save(step, e)
+            if last_step:
+                raise
+            return False
+        if saved and self.checkpointer.save_future is not None:
+            self._pending_save_step = step
+        elif saved:
+            self._failed_saves = 0
+        return saved
+
+    def _drop_failed_save(self, step: int, error: BaseException) -> None:
+        """Remove a failed save's folder; three failures in a row still raise."""
+        self._failed_saves += 1
+        path = self.checkpointer._create_checkpoint_id(step)
+        logger.warning(
+            f"checkpoint save of step {step} failed ({self._failed_saves} in a row): "
+            f"{error!r}; removing {path} and continuing"
+        )
+        if torch.distributed.get_rank() == 0:
+            shutil.rmtree(path, ignore_errors=True)
+        if self._failed_saves >= 3:
+            raise error
+
+    @endpoint
+    @sl.log_trace_span("push_model_state_dict")
+    async def push_model_state_dict(self) -> None:
+        """Stage model weights to a CPU StorageVolume for the generators to pull (TorchStore).
+
+        `direct_rdma=False` copies the state dict GPU->CPU, so the trainer's GPU weights are free once
+        this returns and any number of generators can read the staged copy.
+        """
+        state_dict = self.model.state_dict()
+        if self._skip_frozen_sync and self._pushed_once:
+            # Keyed by state_dict names: named_parameters() keeps wrapper prefixes
+            # (activation checkpointing) that state_dict() strips.
+            frozen = {
+                k
+                for k, v in self.model.state_dict(keep_vars=True).items()
+                if isinstance(v, torch.nn.Parameter) and not v.requires_grad
+            }
+            state_dict = {k: v for k, v in state_dict.items() if k not in frozen}
+            if not self._logged_frozen_skip:
+                logger.info(f"Weight push skips {len(frozen)} frozen params")
+                self._logged_frozen_skip = True
+        if self._transfer_dtype is not None:
+            # TorchStore's generic transfer_dtype cast cannot distinguish model
+            # parameters from buffers. Cast parameters here while preserving
+            # declared buffer dtypes such as Qwen3.5's FP32 expert_bias_E.
+            state_dict = _cast_state_dict_parameters_for_transfer(
+                state_dict, self.model, self._transfer_dtype
+            )
+
+        await ts.put_state_dict(
+            state_dict,
+            "model_state_dict",
+            direct_rdma=False,
+        )
+        self._pushed_once = True

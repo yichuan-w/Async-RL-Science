@@ -1,0 +1,270 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Generator routing."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from enum import auto, Enum
+from typing import Any
+
+from torchtitan.config import Configurable
+from torchtitan.experiments.rl.routing.strategies import (
+    LeastLoadedRoutingStrategy,
+    RoutingStrategy,
+)
+from torchtitan.experiments.rl.routing.types import RoutingCandidate, RoutingContext
+from torchtitan.observability import structured_logger as sl
+
+logger = logging.getLogger(__name__)
+
+
+class _GeneratorState(Enum):
+    """Lifecycle state controlling routability; ``SYNCING`` is only entered when draining (i.e. hot-swap is off)."""
+
+    SERVING = auto()
+    SYNCING = auto()
+
+
+@dataclass(kw_only=True, slots=True)
+class _GeneratorHandle(RoutingCandidate):
+    """Controller-side metadata for one generator mesh."""
+
+    actor: Any
+    """Monarch actor handle for the generator mesh."""
+
+    reserved_load: int = 0
+    """Controller-side estimate of in-flight routed generation work."""
+
+    state: _GeneratorState = _GeneratorState.SERVING
+    """Current routing lifecycle state for this generator."""
+
+    idle: asyncio.Event = field(default_factory=asyncio.Event)
+    """Set when this generator has no reserved routed calls."""
+
+
+class InterGeneratorRouter(Configurable):
+    """Routes generation calls across generator meshes and pulls model's state dict.
+
+    This is layer 1 of the two-layer routing design: it routes each call across
+    generator *meshes* (replicas). Within the chosen mesh, ``IntraGeneratorRouter``
+    then routes the request across that mesh's data-parallel ranks.
+
+    Thread safety:
+        This class is not thread-safe. Its mutable state and ``asyncio.Event``
+        objects are intended to be accessed from one event loop. Do not call a
+        single router instance from multiple OS threads or event loops.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        strategy: RoutingStrategy.Config = field(
+            default_factory=LeastLoadedRoutingStrategy.Config
+        )
+        """Routing strategy, selected by its config type, e.g.
+        ``RoundRobinRoutingStrategy.Config()`` or
+        ``LeastLoadedRoutingStrategy.Config()``."""
+
+        hot_swap: bool = True
+        """When True, pulls model's state dict concurrently with in-flight
+        generation (no draining). When False, each generator is drained before
+        its pull.
+
+        Draining only waits for a generator's in-flight ``route`` call (one
+        turn) to finish; between turns of a multi-turn rollout the generator is
+        idle, so a weight sync may land mid-rollout and successive turns can run
+        under different policy versions."""
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        generators: Sequence[Any],
+    ):
+        self._config = config
+        self._generators = [
+            _GeneratorHandle(actor=generator) for generator in generators
+        ]
+        if not self._generators:
+            raise ValueError("InterGeneratorRouter requires at least one generator")
+        for h in self._generators:
+            h.idle.set()
+
+        self._strategy = config.strategy.build()
+        self._load_log_at = 0.0
+        self._cancel_tasks: set[asyncio.Task] = set()
+        self._serving = asyncio.Event()
+        self._refresh_serving_status()
+
+    def _candidates(self) -> list[_GeneratorHandle]:
+        """Return generator handles that are currently routable."""
+
+        return [h for h in self._generators if h.state is _GeneratorState.SERVING]
+
+    def _refresh_serving_status(self) -> None:
+        """Update whether any generator can serve; only changes while draining (i.e. hot-swap is off)."""
+
+        if self._candidates():
+            self._serving.set()
+        else:
+            self._serving.clear()
+
+    def _set_state(self, h: _GeneratorHandle, state: _GeneratorState) -> None:
+        """Move a generator between serving and syncing states."""
+
+        h.state = state
+        self._refresh_serving_status()
+
+    def _reserve(self, h: _GeneratorHandle, cost: int) -> None:
+        """Reserve estimated generation work on a handle before dispatch."""
+
+        if cost < 0:
+            raise ValueError(f"route estimated_cost must be non-negative, got {cost}")
+        if h.reserved_load == 0:
+            h.idle.clear()
+        h.reserved_load += cost
+        self._log_load()
+
+    def _release(self, h: _GeneratorHandle, cost: int) -> None:
+        """Release estimated generation work after a routed call finishes."""
+
+        h.reserved_load -= cost
+        assert (
+            h.reserved_load >= 0
+        ), f"generator reserved_load went negative: {h.reserved_load}"
+        if h.reserved_load == 0:
+            h.idle.set()
+        self._log_load()
+
+    def _log_load(self) -> None:
+        now = time.monotonic()
+        if now - self._load_log_at < 30:
+            return
+        self._load_log_at = now
+        # Loads only: every replica's actor repr was ~70% of a run's console
+        # bytes, forwarded from every rollout worker every 30 s.
+        logger.info(
+            "[routing] controller replicas=%d reserved_load=%s",
+            len(self._generators),
+            [h.reserved_load for h in self._generators],
+        )
+
+    async def route(
+        self,
+        method: str,
+        *args,
+        routing_ctx: RoutingContext,
+        **kwargs,
+    ) -> Any:
+        """Dispatch one call to a strategy-chosen serving generator; return its result."""
+
+        await self._serving.wait()
+        candidates = self._candidates()
+        assert candidates, "serving event was set with no serving generators"
+        h = self._strategy.choose(routing_ctx, candidates)
+        self._reserve(h, routing_ctx.estimated_cost)
+        try:
+            return await getattr(h.actor, method).call(*args, **kwargs)
+        except BaseException:
+            if method == "generate" and "request_id" in kwargs:
+                # The chosen actor owns the request even if routing preferences
+                # or serving states have changed while the caller was waiting.
+                task = asyncio.create_task(
+                    self._cancel_generation(h, kwargs["request_id"])
+                )
+                self._cancel_tasks.add(task)
+                task.add_done_callback(self._cancel_tasks.discard)
+            raise
+        finally:
+            self._release(h, routing_ctx.estimated_cost)
+
+    async def _cancel_generation(self, h: _GeneratorHandle, request_id: str) -> None:
+        try:
+            await h.actor.cancel_generation.call(request_id=request_id)
+        except Exception:
+            logger.exception("Failed to cancel generation request %s", request_id)
+
+    async def fanout(
+        self,
+        method: str,
+        *args,
+        return_exceptions: bool = False,
+        **kwargs,
+    ) -> list[Any | BaseException]:
+        """Call ``method`` on every generator concurrently and gather results.
+
+        Args:
+            method: Actor endpoint name to call on every generator.
+            *args: Positional arguments forwarded to each call.
+            return_exceptions: If False (default), the first exception
+                propagates immediately; if True, each call's exception is
+                returned in the list instead of raised. Either way, a failure
+                never cancels the other calls.
+            **kwargs: Keyword arguments forwarded to each call.
+
+        Returns:
+            One entry per generator, in order: its result, or its exception when
+            ``return_exceptions`` is True.
+        """
+        return await asyncio.gather(
+            *[getattr(h.actor, method).call(*args, **kwargs) for h in self._generators],
+            return_exceptions=return_exceptions,
+        )
+
+    @property
+    def num_generators(self) -> int:
+        return len(self._generators)
+
+    async def pull_model_state_dict(
+        self, *, policy_version: int, generator_indices: Sequence[int] | None = None
+    ) -> None:
+        """Pull the given policy version's state dict into every generator, or
+        only into ``generator_indices`` (positions in the ``generators`` list).
+
+        Args:
+            policy_version: Trainer policy version whose state dict to pull.
+            generator_indices: Generators to update; None updates all of them.
+        """
+
+        async def _pull_one(h: _GeneratorHandle) -> None:
+            if self._config.hot_swap:
+                # Hot swap: pull concurrently with in-flight generation, without
+                # draining. Whether the pull is genuinely concurrent and safe is
+                # up to the generator's implementation.
+                await h.actor.pull_model_state_dict.call(policy_version)
+            else:
+                # Drain: stop routing to this generator and wait for in-flight
+                # work to finish before pulling, then re-admit it.
+                self._set_state(h, _GeneratorState.SYNCING)
+                try:
+                    with sl.log_trace_span("router_drain_wait"):
+                        await h.idle.wait()
+                    await h.actor.pull_model_state_dict.call(policy_version)
+                finally:
+                    self._set_state(h, _GeneratorState.SERVING)
+
+        # Start the pulls in parallel. Technically we could do rolling sync to
+        # maintain availability during weight sync, but that's not a priority
+        # for now. Let every pull settle before raising: a plain gather returns
+        # on the first failure and abandons the sibling pulls, and a caller that
+        # retries then has those calls cancelled inside the generator actors, which
+        # Monarch treats as the actor aborting.
+        results = await asyncio.gather(
+            *[
+                _pull_one(h)
+                for i, h in enumerate(self._generators)
+                if generator_indices is None or i in generator_indices
+            ],
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result

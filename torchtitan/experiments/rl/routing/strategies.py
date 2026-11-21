@@ -1,0 +1,225 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Routing strategies.
+
+A ``RoutingStrategy`` chooses one ``RoutingCandidate`` from a set given a
+``RoutingContext``. It depends only on the ``RoutingCandidate`` base class -- a
+``reserved_load`` field plus object identity -- so the same strategy classes
+serve both routing layers in the RL generator:
+
+- Layer 1: ``InterGeneratorRouter`` (controller side) routes a call across
+  generator *meshes* (replicas). See ``inter_generator_router.py``.
+- Layer 2: ``IntraGeneratorRouter`` (in-mesh, rank-0 side) routes a request
+  across the *data-parallel ranks* within one generator mesh. See
+  ``intra_generator_router.py``.
+
+Each layer supplies its own candidate type (``_GeneratorHandle`` for generators,
+``_DPRankHandle`` for DP ranks). The data types live in ``types.py``.
+"""
+
+from __future__ import annotations
+
+import itertools
+import random
+from abc import ABC, abstractmethod
+from collections import OrderedDict
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+
+from torchtitan.config import Configurable
+from torchtitan.experiments.rl.routing.types import RoutingCandidate, RoutingContext
+
+
+class RoutingStrategy(Configurable, ABC):
+    """Policy object that chooses one candidate for a request.
+
+    Add a new strategy by subclassing this, defining a nested ``Config``, and
+    selecting it explicitly in config, e.g.
+    ``InterGeneratorRouter.Config(strategy=MyRoutingStrategy.Config())``.
+    """
+
+    def __init__(self, config: Configurable.Config):
+        # Stateless by default; stateful strategies override __init__.
+        del config
+
+    @abstractmethod
+    def choose(
+        self,
+        routing_ctx: RoutingContext,
+        candidates: Sequence[RoutingCandidate],
+    ) -> RoutingCandidate:
+        """Choose one candidate from the (non-empty) candidates."""
+
+
+class RoundRobinRoutingStrategy(RoutingStrategy):
+    """Cycle over the candidates in order, ignoring load."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        pass
+
+    def __init__(self, config: Config):
+        del config
+        self._counter = itertools.count()
+
+    def choose(
+        self,
+        routing_ctx: RoutingContext,
+        candidates: Sequence[RoutingCandidate],
+    ) -> RoutingCandidate:
+        """Return the next candidate in round-robin order."""
+
+        del routing_ctx
+        return candidates[next(self._counter) % len(candidates)]
+
+
+class LeastLoadedRoutingStrategy(RoutingStrategy):
+    """Pick the least reserved load, rotating equal-load choices."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        pass
+
+    def __init__(self, config: Config):
+        del config
+        self._rng = random.Random()
+
+    def choose(
+        self,
+        routing_ctx: RoutingContext,
+        candidates: Sequence[RoutingCandidate],
+    ) -> RoutingCandidate:
+        """Respect load first; avoid repeatedly pinning idle sessions to rank 0."""
+        del routing_ctx
+        minimum = min(h.reserved_load for h in candidates)
+        minimum_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.reserved_load == minimum
+        ]
+        # Randomize only exact ties. Load still has strict priority, while a
+        # fresh router does not deterministically seed the first cold session
+        # on rank 0.
+        return self._rng.choice(minimum_candidates)
+
+
+class StickySessionRoutingStrategy(RoutingStrategy):
+    """Keep requests from the same session on the same candidate."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        max_sessions: int = 4096
+        """Maximum number of session-to-candidate assignments to retain,
+        evicting least-recently-used sessions first."""
+
+        fallback_strategy: RoutingStrategy.Config = field(
+            default_factory=LeastLoadedRoutingStrategy.Config
+        )
+        """Routing strategy used for new sessions and requests without a session."""
+
+        rebalance_load_ratio: float = 0.0
+        """Break a pin when the pinned candidate is this many times more loaded
+        than the least-loaded one (``pinned.reserved_load >
+        ratio * least.reserved_load + rebalance_min_gap``): the request goes to
+        the least-loaded candidate and the session is re-pinned there. 0 keeps a
+        pin for the session's whole life.
+
+        Why: a pin for life has no restoring force. Once one candidate saturates,
+        its sessions crawl (each turn waits in its queue), run out their whole
+        time budget, and stay pinned there, while the other candidates' sessions
+        finish early and cycle out -- so the loaded candidate only accumulates.
+        Two 9B runs reached a 15-22x in-flight skew across
+        3 DP ranks this way, with the idle ranks unable to run faster because
+        engine.step() is SPMD lockstep. The fallback picks the CURRENT least-loaded
+        candidate, and reserving raises its load, so moves water-fill and stop by
+        themselves. A moved session re-prefills once."""
+
+        rebalance_min_gap: int = 8
+        """Absolute in-flight headroom before a ratio breach counts, so a
+        3-vs-0 idle tie does not bounce sessions around."""
+
+        def __post_init__(self):
+            if self.max_sessions <= 0:
+                raise ValueError(
+                    f"max_sessions must be positive, got {self.max_sessions}"
+                )
+            if self.rebalance_load_ratio < 0:
+                raise ValueError(
+                    "rebalance_load_ratio must be non-negative, got "
+                    f"{self.rebalance_load_ratio}"
+                )
+            if self.rebalance_min_gap < 0:
+                raise ValueError(
+                    f"rebalance_min_gap must be non-negative, got {self.rebalance_min_gap}"
+                )
+
+    def __init__(self, config: Config):
+        self._max_sessions = config.max_sessions
+        self._fallback_strategy = config.fallback_strategy.build()
+        self._rebalance_strategy = LeastLoadedRoutingStrategy.Config().build()
+        self._rebalance_ratio = config.rebalance_load_ratio
+        self._rebalance_min_gap = config.rebalance_min_gap
+        self._sessions: OrderedDict[str, RoutingCandidate] = OrderedDict()
+
+    def choose(
+        self,
+        routing_ctx: RoutingContext,
+        candidates: Sequence[RoutingCandidate],
+    ) -> RoutingCandidate:
+        """Return the session's assigned candidate, or assign a new one.
+
+        Unpinned requests (no ``session_id``) and first-seen sessions defer to
+        the fallback strategy; a session's first assignment is then remembered so
+        every later request with that key reuses the same candidate. If a
+        session's pinned candidate is no longer available (e.g. a mesh draining
+        for a weight sync), the request falls back and the session is re-pinned to
+        the newly chosen candidate. The map is bounded by ``max_sessions`` and
+        evicts the least-recently-used session.
+        """
+
+        # Unpinned request: no affinity, defer entirely to the fallback.
+        if routing_ctx.session_id is None:
+            return self._fallback_strategy.choose(routing_ctx, candidates)
+
+        # Reuse the pinned candidate, but only while it is still available
+        # (e.g. not draining for a weight sync).
+        sticky_candidate = self._sessions.get(routing_ctx.session_id)
+        if sticky_candidate is not None:
+            if any(h is sticky_candidate for h in candidates):
+                if self._rebalance_ratio > 0 and len(candidates) > 1:
+                    least = min(candidates, key=lambda h: h.reserved_load)
+                    if (
+                        least is not sticky_candidate
+                        and sticky_candidate.reserved_load
+                        > self._rebalance_ratio * least.reserved_load
+                        + self._rebalance_min_gap
+                    ):
+                        least = self._rebalance_strategy.choose(routing_ctx, candidates)
+                        # Pinned candidate is swamped: move this session to the
+                        # least-loaded one. See Config.rebalance_load_ratio.
+                        self._sessions[routing_ctx.session_id] = least
+                        self._sessions.move_to_end(routing_ctx.session_id)
+                        return least
+                # End of the dict means it's the most-recently-used session.
+                self._sessions.move_to_end(routing_ctx.session_id)
+                return sticky_candidate
+
+        # New session, or the pinned candidate is unavailable: choose via the
+        # fallback and (re)pin the session to that candidate.
+        chosen = self._fallback_strategy.choose(routing_ctx, candidates)
+        self._sessions[routing_ctx.session_id] = chosen
+        # End of the dict means it's the most-recently-used session.
+        self._sessions.move_to_end(routing_ctx.session_id)
+        # Evict the least-recently-used session if the map is full. We assume
+        # max_sessions is large enough that active sessions are never the LRU
+        # victim (only stale, finished sessions get evicted).
+        # TODO: relying solely on max_sessions to avoid premature eviction is
+        # easy to implement, but not robust for all scenarios. Revisit with an
+        # more robust approach.
+        if len(self._sessions) > self._max_sessions:
+            self._sessions.popitem(last=False)
+        return chosen

@@ -1,0 +1,2647 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+from __future__ import annotations
+
+import asyncio
+import enum
+import gc
+import logging
+import math
+import os
+import time
+from dataclasses import dataclass, field, replace
+from datetime import timedelta
+from typing import Any, Literal
+
+import cloudpickle
+import torch
+import torch.distributed as dist
+import torchstore as ts
+from monarch.actor import Actor, Channel, current_rank, Port, PortReceiver
+from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.config import CompileConfig, Configurable, DebugConfig, OverrideConfig
+from torchtitan.distributed.dp_weight_broadcast import (
+    dp_weight_broadcast_unsupported_reason,
+    DPWeightBroadcaster,
+)
+from torchtitan.distributed.utils import set_batch_invariance
+from torchtitan.experiments.rl.actors.monarch_compat import endpoint
+from torchtitan.experiments.rl.batch_invariance import (
+    force_logprobs_fn_for_batch_invariance,
+    patch_bmm_for_batch_invariance,
+    patch_matmul_for_small_m_batch_invariance,
+)
+from torchtitan.experiments.rl.models.cast_linear import (
+    refresh_cast_linear_inference_caches,
+    set_cast_linear_inference_cache,
+)
+from torchtitan.experiments.rl.models.vllm_registry import (
+    InferenceParallelismConfig,
+    register_to_vllm,
+    TORCHTITAN_CONFIG_FORMAT,
+)
+from torchtitan.experiments.rl.native_ep_partial_pull import (
+    expert_dims,
+    local_expert_range,
+    NativeEPPartialPull,
+)
+from torchtitan.experiments.rl.native_fast_apply import NativeFastApply
+from torchtitan.experiments.rl.native_tp_partial_pull import (
+    NativeTPPartialPull,
+    tp_rules_from_vllm_model,
+)
+from torchtitan.experiments.rl.observability import metrics as m
+from torchtitan.experiments.rl.routing.intra_generator_router import (
+    IntraGeneratorRouter,
+)
+from torchtitan.experiments.rl.types import Completion, SamplerTopK
+from torchtitan.models.common.attention import FlexAttention, VarlenAttention
+from torchtitan.observability import structured_logger as sl
+from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.tools.logging import init_logger
+from vllm import EngineArgs, LLMEngine, SamplingParams
+from vllm.config import AttentionConfig, CompilationConfig, ParallelConfig
+from vllm.config.compilation import CompilationMode, PassConfig
+from vllm.distributed import get_dp_group
+from vllm.logprobs import FlatLogprobs
+from vllm.outputs import RequestOutput
+from vllm.sampling_params import RequestOutputKind
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.metrics.loggers import StatLoggerBase
+
+
+# RL_TS_REPLICA_DEDUP=1: read each replicated (HSDP) weight region from one
+# TorchStore volume instead of every replica (torchstore_replica_dedup.py).
+if os.environ.get("RL_TS_REPLICA_DEDUP", "0") == "1":
+    from torchtitan.experiments.rl.torchstore_replica_dedup import install
+
+    install()
+
+logger = logging.getLogger(__name__)
+
+
+# Latest engine-aggregate stats of this process's engine (one per generator
+# process), stamped onto every finished request's metrics so they reach W&B.
+_ENGINE_STATS: dict[str, float] = {}
+
+
+class _EngineStatsLogger(StatLoggerBase):
+    """Engine-aggregate vLLM stats (KV-cache usage, queue depth, preemptions).
+
+    vLLM's own LoggingStatLogger prints these every 10 s through the ``vllm``
+    logger, but remote generator processes do not forward their output to the
+    controller console (no run since at least 1018 has a vLLM line there). So
+    ``record`` keeps the latest values in ``_ENGINE_STATS`` for the per-request
+    metrics (``engine_kv_cache_usage``, ``engine_waiting_reqs``,
+    ``engine_preempted_total``, each Mean and Max per step), and ``log`` writes one
+    line per ``RL_VLLM_STATS_INTERVAL_SEC`` (default 60; 0 = off) for wherever the
+    process's own output is kept. A rising preempted total is KV thrashing: each
+    preempted request is re-prefilled. The line also carries the window's prefix
+    cache hit rate (hit tokens / queried tokens, preempted re-prefills included).
+    """
+
+    def __init__(self, vllm_config: Any, engine_index: int = 0) -> None:
+        self._interval = float(os.environ.get("RL_VLLM_STATS_INTERVAL_SEC", "60"))
+        self._engine_index = engine_index
+        self._last = time.monotonic()
+        self._running = self._waiting = 0
+        self._kv_peak = 0.0
+        self._preempted = self._preempted_total = 0
+        self._prefix_queries = self._prefix_hits = 0
+
+    def record(
+        self,
+        scheduler_stats: Any,
+        iteration_stats: Any,
+        mm_cache_stats: Any = None,
+        engine_idx: int = 0,
+    ) -> None:
+        if scheduler_stats is not None:
+            self._running = scheduler_stats.num_running_reqs
+            self._waiting = (
+                scheduler_stats.num_waiting_reqs
+                + scheduler_stats.num_skipped_waiting_reqs
+            )
+            self._kv_peak = max(self._kv_peak, scheduler_stats.kv_cache_usage)
+            _ENGINE_STATS["kv_cache_usage"] = scheduler_stats.kv_cache_usage
+            _ENGINE_STATS["waiting_reqs"] = self._waiting
+            prefix = getattr(scheduler_stats, "prefix_cache_stats", None)
+            if prefix is not None:
+                self._prefix_queries += prefix.queries + prefix.preempted_queries
+                self._prefix_hits += prefix.hits + prefix.preempted_hits
+        if iteration_stats is not None:
+            self._preempted += iteration_stats.num_preempted_reqs
+            _ENGINE_STATS["preempted_total"] = (
+                _ENGINE_STATS.get("preempted_total", 0)
+                + iteration_stats.num_preempted_reqs
+            )
+
+    def log_engine_initialized(self) -> None:
+        pass
+
+    def log(self) -> None:
+        now = time.monotonic()
+        if self._interval <= 0 or now - self._last < self._interval:
+            return
+        self._preempted_total += self._preempted
+        prefix_hit = (
+            f"{100 * self._prefix_hits / self._prefix_queries:.1f}%"
+            if self._prefix_queries
+            else "n/a"
+        )
+        logger.info(
+            f"[vllm_stats] engine={self._engine_index} running={self._running} "
+            f"waiting={self._waiting} kv_peak={100 * self._kv_peak:.1f}% "
+            f"preempted={self._preempted} preempted_total={self._preempted_total} "
+            f"prefix_hit={prefix_hit} window_s={now - self._last:.0f}"
+        )
+        # Also to the structured log: it is mirrored into the run dump while the
+        # job runs, unlike this process's stdout.
+        sl.log_trace_scalar(
+            {
+                "vllm_stats.running": self._running,
+                "vllm_stats.waiting": self._waiting,
+                "vllm_stats.kv_peak": self._kv_peak,
+                "vllm_stats.preempted": self._preempted,
+                "vllm_stats.preempted_total": self._preempted_total,
+                **(
+                    {"vllm_stats.prefix_hit": self._prefix_hits / self._prefix_queries}
+                    if self._prefix_queries
+                    else {}
+                ),
+            }
+        )
+        self._last = now
+        self._kv_peak = 0.0
+        self._preempted = 0
+        self._prefix_queries = self._prefix_hits = 0
+
+
+def _flash_attention_kernels_available() -> bool:
+    """Whether this GPU's FlashAttention kernels (FA3 on Hopper, FA4 on Blackwell)
+    are installed, so vLLM will not silently fall back to FA2.
+
+    Activation is the only reliable probe: ``list_flash_attention_impls`` reports
+    registered names even when the underlying package is missing (FA4 is registered
+    by torch itself but needs a separate flash-attn-4 install).
+    """
+    from torch.nn.attention import activate_flash_attention_impl
+
+    from torchtitan.tools.utils import get_cuda_flash_attention_impl
+
+    impl = get_cuda_flash_attention_impl()
+    if impl is None:
+        return False
+    try:
+        activate_flash_attention_impl(impl)
+    except Exception as e:
+        logger.warning(
+            f"FlashAttention {impl} kernels unavailable ({type(e).__name__}: {e}); "
+            "vLLM will use FA2, so forcing block_size=256"
+        )
+        return False
+    return True
+
+
+# Scheduler token budget for GDN models under align-mode prefix caching. Chunked
+# prefill is required there, so this is a real per-step budget rather than a
+# "never chunk" sentinel. RL_GDN_MAX_NUM_BATCHED_TOKENS overrides it: a larger
+# budget admits cold-prefilled requests faster (a queue of ~18K-token re-prefills
+# behind an 8192 budget drains at ~2.7 req/s per engine, measured) but costs
+# a few GB of KV per card -- vLLM sizes its non-KV reserve from a dummy forward
+# of this many tokens -- and makes prefill-heavy lockstep steps longer.
+_GDN_ALIGN_MAX_NUM_BATCHED_TOKENS = int(
+    os.environ.get("RL_GDN_MAX_NUM_BATCHED_TOKENS", "8192")
+)
+
+
+def _state_dict_local_gib(state_dict: dict) -> float:
+    """Local (this-rank) byte size of a state dict, in GiB. Counts the bytes each
+    rank actually moves over the wire on a pull -- DTensor values report their local
+    shard, plain tensors their full size. Used to turn the [pull-timing] transfer
+    seconds into an achieved GB/s so the fabric throughput is measured, not guessed."""
+    total_bytes = 0
+    for value in state_dict.values():
+        if not isinstance(value, torch.Tensor):
+            continue
+        local = value.to_local() if hasattr(value, "to_local") else value
+        total_bytes += local.numel() * local.element_size()
+    return total_bytes / (1024**3)
+
+
+def _resolve_max_num_batched_tokens(
+    *,
+    max_model_len: int,
+    has_gdn_layers: bool,
+    prefix_caching_enabled: bool,
+    gdn_trainer_parity: bool,
+) -> int | None:
+    """Return the vLLM scheduler override required by hybrid GDN modes."""
+    if gdn_trainer_parity:
+        # Bitwise parity needs the whole prefill in ONE scheduler step: GDN's
+        # chunk-parallel prefill recurs a state over the sequence, and a state
+        # recurred over two vLLM chunks is not bitwise equal to one recurred over
+        # the full prefix, so the trainer's logprobs stop matching.
+        return max(max_model_len, 2048)
+    if prefix_caching_enabled and has_gdn_layers:
+        # NOT max_model_len here. vLLM's align-mode Mamba prefix caching (the mode
+        # it selects for these models) *requires* chunked prefill -- see
+        # MambaModelConfig.verify_and_update_config: `assert
+        # enable_chunked_prefill, "Chunked prefill is required for mamba cache mode
+        # 'align'"` -- because align checkpoints the GDN state on KV-block
+        # boundaries. Pinning the budget to max_model_len therefore bought nothing
+        # and cost twice: vLLM sizes its non-KV reserve from a dummy forward of this
+        # many tokens (measured on the 27B: a 65536 budget left 28.06 GiB of KV
+        # where 8192 leaves ~35 GiB), and a single 65536-token prefill fills a whole
+        # scheduler step, so no decode runs in it. Kept well above the 1056-token
+        # Mamba page so a page still fits in one step. Written as a cap, not a flat
+        # constant, so a short-context model keeps its old budget (its whole prefill
+        # already fits one step) and only long contexts start chunking.
+        return max(2048, min(_GDN_ALIGN_MAX_NUM_BATCHED_TOKENS, max_model_len))
+    return None
+
+
+# TODO(async-rl): this file is large. Split a backend-agnostic BaseGenerator.
+
+
+def _install_flashinfer_allreduce_import_stub() -> None:
+    """Avoid importing flashinfer.comm when vLLM's CudaCommunicator is unused.
+
+    vLLM imports ``flashinfer_all_reduce`` unconditionally while constructing a
+    CUDA device communicator, even when FlashInfer all-reduce is disabled. In some
+    packaged conda runtimes, importing ``flashinfer.comm`` can resolve cudart to
+    tilelang's stub library, which lacks cudaDeviceReset and aborts engine init.
+    The torchtitan_wrapper path does not use FlashInfer all-reduce, so install a
+    no-op module before ``LLMEngine.from_engine_args`` reaches that import.
+    """
+    import sys
+    import types
+
+    module_name = "vllm.distributed.device_communicators.flashinfer_all_reduce"
+    if module_name in sys.modules:
+        return
+
+    module = types.ModuleType(module_name)
+
+    def _disabled(*args: object, **kwargs: object) -> None:
+        raise RuntimeError(
+            "FlashInfer all-reduce is disabled in TorchTitan's "
+            "torchtitan_wrapper generator path."
+        )
+
+    class FlashInferAllReduce:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            _disabled()
+
+    module.FlashInferAllReduce = FlashInferAllReduce
+    # TP>1 additionally pulls in the allreduce+rmsnorm fusion pass, which imports
+    # the workspace helpers from this module at import time. Stub them too: the
+    # getters raise if something actually tries to allocate a FlashInfer
+    # workspace, while destroy is a no-op so teardown paths stay safe.
+    module.get_fi_ar_workspace = _disabled
+    module.get_fi_ar_quant_workspace = _disabled
+    module.destroy_fi_ar_workspace = lambda *args, **kwargs: None
+    sys.modules[module_name] = module
+
+
+def _install_fp32_native_lm_head() -> None:
+    """Make vLLM's native lm_head matmul run in fp32 (matches the trainer).
+
+    The torchtitan trainer wraps lm_head in CastLinear (fp32 matmul); the
+    torchtitan_wrapper generator reuses it, so both sides are fp32. The
+    vllm_native generator instead uses vLLM's own ParallelLMHead, whose matmul
+    is bf16 (only the sampler log_softmax upcasts to fp32) -> a per-logit bf16
+    rounding difference vs the trainer. Patch LogitsProcessor._apply_head to
+    upcast hidden_states + lm_head weight to fp32 before the matmul so the
+    native generator's logits match the trainer's fp32 lm_head.
+    """
+    import torch.nn.functional as F
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+    if getattr(LogitsProcessor, "_tt_fp32_lm_head", False):
+        return
+    # Patch the matmul alone and leave TP gather, vocab-padding and skip_gather to
+    # vLLM: _get_logits has already gained a parameter once, and re-implementing
+    # its body here made the generator die on the new signature. Older builds
+    # (e.g. some August nightlies) predate _apply_head and still take the
+    # 4-arg _get_logits, so fall back to patching that -- raising here would
+    # kill every vllm_native generator on those builds at first forward.
+    # Upcasting the full vocab x hidden weight on every call costs a 2-4 GB
+    # read+write per lm_head call (~0.9 ms each on H100, one call per decode step
+    # and one more per MTP draft step). Keep a persistent fp32 copy on the module
+    # instead (same math); _refresh_fp32_lm_head_cache updates it in place after
+    # each weight sync. RL_GEN_FP32_LMHEAD_CACHE=0 restores the per-call upcast.
+    cache = os.environ.get("RL_GEN_FP32_LMHEAD_CACHE", "1") == "1"
+
+    def _weight_fp32(lm_head):
+        if not cache:
+            return lm_head.weight.float()
+        w32 = getattr(lm_head, "_tt_w32", None)
+        if w32 is None:
+            w32 = lm_head.weight.detach().float()
+            object.__setattr__(lm_head, "_tt_w32", w32)
+        return w32
+
+    if hasattr(LogitsProcessor, "_apply_head"):
+
+        def _fp32_apply_head(self, lm_head, hidden_states, embedding_bias):
+            bias = None if embedding_bias is None else embedding_bias.float()
+            return F.linear(hidden_states.float(), _weight_fp32(lm_head), bias)
+
+        LogitsProcessor._apply_head = _fp32_apply_head
+    else:
+
+        def _fp32_get_logits(self, hidden_states, lm_head, embedding_bias):
+            bias = None if embedding_bias is None else embedding_bias.float()
+            logits = F.linear(hidden_states.float(), _weight_fp32(lm_head), bias)
+            logits = self._gather_logits(logits)
+            if logits is not None:
+                logits = logits[..., : self.org_vocab_size]
+            return logits
+
+        LogitsProcessor._get_logits = _fp32_get_logits
+    LogitsProcessor._tt_fp32_lm_head = True
+
+
+def _refresh_fp32_lm_head_cache(model: torch.nn.Module) -> None:
+    """Copy freshly loaded lm_head weights into the fp32 caches, in place so any
+    tensor already captured by a CUDA graph sees the new values. The cache is
+    first built inside vLLM's forward, under inference mode, so it is an
+    inference tensor and may only be updated in place under inference mode."""
+    with torch.inference_mode():
+        for module in model.modules():
+            w32 = getattr(module, "_tt_w32", None)
+            if w32 is not None:
+                w32.copy_(module.weight)
+
+
+@dataclass(kw_only=True, slots=True)
+class _RequestMetricsInputs:
+    """Raw inputs needed to build a request's vLLM metrics. Used to pass
+    metric related information when fan-in from DPs to rank 0.
+    """
+
+    num_cached_tokens: int | None
+    has_stats: bool
+    num_prompt_tokens: int = 0
+    queued_ts: float = 0.0
+    scheduled_ts: float = 0.0
+    first_token_ts: float = 0.0
+    last_token_ts: float = 0.0
+    first_token_latency: float = 0.0
+    num_generation_tokens: int = 0
+
+
+def _split_flat_logprobs(
+    flat: FlatLogprobs,
+) -> tuple[list[float], SamplerTopK]:
+    """Split vLLM's flat sample logprobs into the sampled token's logprob and
+    the top-k.
+
+    Each position holds ``[sampled, top-1, ..., top-k]`` (the sampler writes the
+    sampled token first, then the top-k, even when the sampled token is among
+    them), so every position has exactly ``k + 1`` entries.
+    """
+    num_positions = len(flat)
+    if num_positions == 0:
+        return [], SamplerTopK.empty_rows(0, 0)
+    width = flat.end_indices[0] - flat.start_indices[0]
+    if len(flat.logprobs) != num_positions * width:
+        raise ValueError(
+            f"uneven flat logprobs: {len(flat.logprobs)} entries over "
+            f"{num_positions} positions"
+        )
+    token_ids = torch.tensor(flat.token_ids, dtype=torch.int32).view(
+        num_positions, width
+    )
+    logprobs = torch.tensor(flat.logprobs, dtype=torch.float32).view(
+        num_positions, width
+    )
+    topk = SamplerTopK(
+        token_ids=token_ids[:, 1:].contiguous(), logprobs=logprobs[:, 1:].contiguous()
+    )
+    return logprobs[:, 0].tolist(), topk
+
+
+def _extract_request_metrics_inputs(
+    request_output: RequestOutput,
+) -> _RequestMetricsInputs:
+    """Pull the raw metric inputs off a finished ``RequestOutput``."""
+    stats = request_output.metrics
+    num_prompt_tokens = len(getattr(request_output, "prompt_token_ids", None) or ())
+    if stats is None:
+        return _RequestMetricsInputs(
+            num_cached_tokens=request_output.num_cached_tokens,
+            has_stats=False,
+            num_prompt_tokens=num_prompt_tokens,
+        )
+    return _RequestMetricsInputs(
+        num_cached_tokens=request_output.num_cached_tokens,
+        has_stats=True,
+        num_prompt_tokens=num_prompt_tokens,
+        queued_ts=stats.queued_ts,
+        scheduled_ts=stats.scheduled_ts,
+        first_token_ts=stats.first_token_ts,
+        last_token_ts=stats.last_token_ts,
+        first_token_latency=stats.first_token_latency,
+        num_generation_tokens=stats.num_generation_tokens,
+    )
+
+
+def _prepare_generation_request_metrics(
+    inputs: _RequestMetricsInputs, *, prefix: str
+) -> list[m.Metric]:
+    """Prepare vLLM per-request metrics from the raw inputs.
+
+    For `add_request` call, vLLM returns a RequestOutput carrying
+    a single `RequestStateStats` (captured into `_RequestMetricsInputs`).
+
+    Caveat under `SamplingParams.n > 1`: vLLM stores one `RequestStateStats`
+    per child request; the parent output exposes the **last-finishing**
+    child's timeline. `arrival_time` is shared across siblings, but
+    [`queued_ts`, `scheduled_ts`, `first_token_ts`, `last_token_ts`,
+    `num_generation_tokens`] describe one specific child - not an aggregate,
+    not the first sibling's. The other `n-1` siblings' stats are dropped by
+    vLLM at ``output_processor._finish_request``.
+    """
+
+    # Per-request fields come from RequestOutput.metrics (RequestStateStats);
+    # the engine_* values are the engine's state when the request finished
+    # (_EngineStatsLogger).
+    metric_values: dict[str, float] = {
+        f"{prefix}/engine_{key}": value for key, value in _ENGINE_STATS.items()
+    }
+    if inputs.num_cached_tokens is not None:
+        metric_values[f"{prefix}/num_cached_tokens"] = inputs.num_cached_tokens
+        if inputs.num_prompt_tokens > 0:
+            metric_values[f"{prefix}/prefix_cache_hit_rate"] = (
+                inputs.num_cached_tokens / inputs.num_prompt_tokens
+            )
+
+    if inputs.has_stats:
+        metric_values[f"{prefix}/queue_time_ms"] = (
+            inputs.scheduled_ts - inputs.queued_ts
+        ) * 1000
+
+        if inputs.num_generation_tokens > 0:
+            metric_values[f"{prefix}/time_to_first_token_ms"] = (
+                inputs.first_token_latency * 1000
+            )
+            metric_values[f"{prefix}/prefill_time_ms"] = (
+                inputs.first_token_ts - inputs.scheduled_ts
+            ) * 1000
+
+        if inputs.num_generation_tokens > 1:
+            first_to_last_token_ms = (
+                inputs.last_token_ts - inputs.first_token_ts
+            ) * 1000
+            metric_values[f"{prefix}/decode_time_ms"] = first_to_last_token_ms
+            metric_values[
+                f"{prefix}/inter_token_latency_ms"
+            ] = first_to_last_token_ms / (inputs.num_generation_tokens - 1)
+
+    # Emit each value with both Mean and Max aggregators.
+    return [
+        metric
+        for key, value in metric_values.items()
+        for metric in (m.Metric(key, m.Mean(value)), m.Metric(key, m.Max(value)))
+    ]
+
+
+# vLLM's chunked-prefill chunk size (max_num_batched_tokens). "FULL" /
+# "FULL_AND_PIECEWISE" also graph prefill, whose per-step token count is bounded
+# by this, so their capture sizes must reach it (else prefill falls back to
+# eager). The generator does not override max_num_batched_tokens, so this is
+# vLLM's default.
+# TODO: this value still needs discussion -- ideally read the engine's actual
+# max_num_batched_tokens rather than hardcoding the default.
+_VLLM_DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048
+
+
+@dataclass(kw_only=True, slots=True)
+class VLLMCudagraphConfig:
+    """CUDA graph capture settings for the vLLM inference engine.
+
+    torch.compile is configured separately via ``CompileConfig`` at the
+    ``Controller`` level, shared by both trainer and generator.  Only CUDA
+    graph capture, which is vLLM-specific, is controlled here.
+
+    ``mode`` selects which vLLM cudagraph mode to capture; see that field and
+    ``get_vllm_compilation_config`` for the per-mode trade-offs. The default,
+    ``FULL_DECODE_ONLY``, is the only mode that is both cheap (no inductor
+    compile) and correct with our varlen/FA3 attention backend.
+    """
+
+    enable: bool = True
+    """Whether to enable CUDA graph capture."""
+
+    mode: Literal["FULL_DECODE_ONLY", "FULL_AND_PIECEWISE", "FULL"] = "FULL_DECODE_ONLY"
+    """Which vLLM cudagraph mode to capture (when ``enable``):
+
+    - ``"FULL_DECODE_ONLY"`` (default): graph pure-decode batches; prefill / mixed
+      batches run eager. Cheap (no inductor compile) and correct with our
+      varlen/FA3 attention backend (#3668).
+    - ``"FULL_AND_PIECEWISE"``: FULL graph for pure single-token decode (whole
+      forward incl. attention -- safe because decode has a fixed query_len==1
+      layout) AND breakable PIECEWISE for prefill / mixed batches (attention runs
+      eager at a stream-capture break). Best coverage: the common decode path
+      gets a full graph while only mixed batches pay the eager-break cost.
+      Requires ``VLLM_USE_BREAKABLE_CUDAGRAPH=1``.
+    - ``"FULL"``: graph the whole forward, prefill included, attention captured
+      too. Only valid with the flex attention backend, which survives FULL
+      capture of mixed prefill+decode batches
+    """
+
+    # TODO: Validate CUDA graph capture with MoE / Expert Parallelism.
+    # MoE routing produces dynamic shapes that may conflict with full
+    # CUDA graph capture despite being torch.compile-compatible
+    # post https://github.com/pytorch/torchtitan/pull/3142
+
+    # TODO: Explore applying CUDA graph capture on the torchtitan trainer
+    # side as well (not just the vLLM generator).
+    # https://github.com/pytorch/torchtitan/issues/3175
+
+    def get_vllm_compilation_config(
+        self, *, max_num_seqs: int
+    ) -> CompilationConfig | None:
+        """Build a vLLM ``CompilationConfig`` for ``mode``, or return ``None``
+        when CUDA graphs are disabled.
+
+        Capture sizes are powers of 2 up to the cap, plus ``max_num_seqs`` and the
+        cap itself as exact sizes so the largest capture size is always the cap
+        (even when it is not a power of 2). The cap is ``max_num_seqs`` for
+        ``FULL_DECODE_ONLY`` (decode batch == num_seqs). ``FULL`` and
+        ``FULL_AND_PIECEWISE`` also graph prefill, whose per-step token count is
+        bounded by vLLM's default ``max_num_batched_tokens``, so the cap extends to
+        ``_VLLM_DEFAULT_MAX_NUM_BATCHED_TOKENS`` -- otherwise prefill chunks larger
+        than the cap fall back to eager.
+
+        All modes capture with ``mode=CompilationMode.NONE`` (no inductor compile).
+        ``FULL_AND_PIECEWISE`` runs attention eager via vLLM's BREAKABLE
+        cudagraph, which requires ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` (vLLM itself
+        also forces ``mode=NONE`` when that env is set) (#3709).
+        """
+        if not self.enable:
+            return None
+        if max_num_seqs <= 0:
+            raise ValueError(f"max_num_seqs must be positive, got {max_num_seqs}")
+        cap = max_num_seqs
+        if self.mode in ("FULL", "FULL_AND_PIECEWISE"):
+            cap = max(cap, _VLLM_DEFAULT_MAX_NUM_BATCHED_TOKENS)
+        sizes = [1 << i for i in range(int(math.log2(cap)) + 1)]
+        # Always include max_num_seqs (decode batch) and the cap (largest prefill
+        # chunk) as exact sizes so the largest capture size is the cap even when it
+        # is not a power of 2
+        if max_num_seqs not in sizes:
+            sizes.append(max_num_seqs)
+        if cap not in sizes:
+            sizes.append(cap)
+        sizes = sorted(sizes)
+
+        return CompilationConfig(
+            cudagraph_mode=self.mode,
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=sizes,
+            # Off because it is unreachable here and, at TP>1, fatal. vLLM resolves
+            # it truthy even at CompilationMode.NONE, and VllmConfig.__post_init__ ->
+            # _set_compile_ranges then asks flashinfer for its allreduce-fusion size
+            # -- but only for world sizes 2/4/8, which is why TP-1 never sees it. In
+            # some deployment conda environments that import lands on an incomplete
+            # flashinfer_all_reduce ("cannot import name destroy_fi_ar_workspace
+            # ... (unknown location)") and every generator dies at engine init.
+            # Nothing is lost: this codebase already runs TP>1 with
+            # disable_custom_all_reduce.
+            pass_config=PassConfig(fuse_allreduce_rms=False),
+        )
+
+
+@dataclass(kw_only=True, slots=True)
+class SamplingConfig:
+    """Sampling parameters passed to vLLM's SamplingParams."""
+
+    temperature: float = 0.8
+    """Sampling temperature. 0.0 = greedy, higher = more random."""
+
+    top_p: float = 0.95
+    """Nucleus sampling threshold."""
+
+    max_tokens: int = 100
+    """Maximum number of tokens to generate per completion."""
+
+    seed: int | None = None
+    """Per-request RNG seed. The rollouter offsets this per sample so a group's
+    n=1 requests stay diverse while remaining reproducible (None = nondeterministic)."""
+
+    stop_token_ids: list[int] | None = None
+    """Renderer role-boundary stop tokens; filled by the controller."""
+
+    num_topk_logprobs: int = 0
+    """Also return the sampler's top-k logprobs at every generated position
+    (``Completion.topk``), for score centering. 0 = sampled token only."""
+
+
+class RequestDispatcher:
+    """Owns the generator's DP/TP request dispatch, hiding the rank layout behind
+    a small interface so ``VLLMGenerator`` does not deal with it directly.
+
+    Every rank holds one dispatcher; methods act according to the rank's role:
+    - Rank 0 is the coordinator (and DP0's tp_rank=0): it holds the generation
+      futures, routes requests, opens the fan-in port, and resolves every
+      completion -- its own replica's locally, peers' via the drain task. State
+      and methods only ever used on rank 0 are prefixed ``rank0_``.
+    - Other DP's tp_rank=0 build finished completions and fan them in
+      to rank 0 over the port.
+    - tp_rank!=0 hold no outputs; their dispatcher only carries the layout.
+
+    Supported rank layout:
+
+        global_rank = dp_rank * tp_degree + tp_rank
+
+    EP reuses the same global-rank -> (dp, tp) mapping, so it needs no special
+    handling here.
+
+    Data flow:
+
+    Take DP=2, TP=2 for example. Only rank 0 holds futures and talks to the
+    controller, so completions produced by any other DP replica must be sent
+    back ("fanned in") to rank 0:
+
+        controller --generate--> rank 0  (registers a future)
+                                   |
+            rank0_route(): pick a DP rank for the queued requests
+                                   |   (broadcast in the LoopDecision, elsewhere)
+              +--------------------+--------------------+
+              v                                         v
+        DP0's tp_rank=0 (i.e. rank 0)               DP1's tp_rank=0 (i.e. rank 2)
+          engine.step()                             engine.step()
+          build (completion, metrics_inputs)        build (completion, metrics_inputs)
+          resolve own futures locally   <--port--   send completions to rank 0
+                                                    (tp_rank!=0: hold no outputs)
+        rank 0 background drain task: recv from port -> resolve those futures
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        parallelism: InferenceParallelismConfig,
+        broadcast_group: dist.ProcessGroup,
+        vllm_parallel_config: ParallelConfig,
+        intra_generator_router: IntraGeneratorRouter.Config,
+    ):
+        self._rank = rank
+        # Only DP and TP are supported, so ``tp_degree`` ranks make up one DP
+        # replica. EP does not change the global-rank -> (dp, tp) mapping, so it
+        # needs no handling here. TODO: revisit if PP/CP are ever added.
+        self._dp_degree = parallelism.data_parallel_degree
+        tp_degree = parallelism.tensor_parallel_degree
+        # Which DP replica this rank belongs to (== vLLM's data_parallel_rank).
+        self._dp_rank = rank // tp_degree
+        # Rank within the DP replica
+        self._tp_rank = rank % tp_degree
+        # Reused for the one-time result-port broadcast (see ``setup``).
+        self._broadcast_group = broadcast_group
+
+        # Confirm our derived layout matches what vLLM computed independently.
+        assert vllm_parallel_config.data_parallel_size == self._dp_degree, (
+            f"DP layout mismatch on rank {self._rank}: our dp_size "
+            f"({self._dp_degree}) != vLLM data_parallel_size "
+            f"({vllm_parallel_config.data_parallel_size})"
+        )
+        assert vllm_parallel_config.data_parallel_rank == self._dp_rank, (
+            f"DP layout mismatch on rank {self._rank}: our dp_rank "
+            f"({self._dp_rank}) != vLLM data_parallel_rank "
+            f"({vllm_parallel_config.data_parallel_rank})"
+        )
+
+        # RANK-0 OUTBOX: futures the engine loop resolves so the awaiting endpoint
+        # returns. Only rank 0 ever populates this.
+        self._rank0_generation_futures: dict[str, GenerationFuture] = {}
+
+        # --- Result fan-in (only when DP>1) ---
+        # rank 0 opens the channel, keeps the receiving end, and its drain task
+        # resolves whatever peer tp_rank=0 send. ``_result_port`` is the sending
+        # end, held only by peer tp_rank=0; it stays None on rank 0 (resolves
+        # locally) and on tp_rank!=0 (no outputs). All None for DP=1 since there
+        # is no peer DP to send from.
+        self._result_port: Port | None = None
+        self._rank0_result_receiver: PortReceiver | None = None
+        self._rank0_drain_task: asyncio.Task | None = None
+        self._finished_count = 0
+        self._received_counts = [0] * self._dp_degree
+        self._late_result_count = 0
+
+        # --- DP routing ---
+        # RANK-0 DP routing: pick a DP rank per request, reserving its load until
+        # the completion resolves.
+        self._rank0_dp_router: IntraGeneratorRouter | None = (
+            intra_generator_router.build(dp_degree=self._dp_degree)
+            if self._rank == 0 and self._dp_degree > 1
+            else None
+        )
+
+    def rank0_register_future(
+        self, request_id: str, metrics_prefix: str
+    ) -> asyncio.Future[Completion]:
+        """RANK 0: register a future for ``request_id`` and return it to await."""
+        if self._rank0_drain_task is not None and self._rank0_drain_task.done():
+            raise RuntimeError("generator peer result drain has stopped")
+        if request_id in self._rank0_generation_futures:
+            raise ValueError(f"request_id {request_id!r} is already in flight")
+        future: asyncio.Future[Completion] = asyncio.get_running_loop().create_future()
+        self._rank0_generation_futures[request_id] = GenerationFuture(
+            future=future, metrics_prefix=metrics_prefix
+        )
+        return future
+
+    def rank0_has_pending_futures(self) -> bool:
+        """RANK 0: whether any request is still in flight (future unresolved).
+
+        A future stays registered until its completion comes back, so this stays
+        True while any peer DP rank is still running.
+        """
+        return bool(self._rank0_generation_futures)
+
+    def rank0_discard_future(self, request_id: str) -> None:
+        """RANK 0: drop the future of a request that will never be admitted.
+
+        Only for requests removed from the queue before routing. Admitted
+        requests also own a DP reservation, released by completion or abort.
+        """
+        entry = self._rank0_generation_futures.pop(request_id, None)
+        if entry is not None and not entry.future.done():
+            # NOT .cancel(): the generate() endpoint is `await`ing this future
+            # inside the actor, and a CancelledError escaping an endpoint is an
+            # actor-fatal BaseException to monarch ("actor explicitly aborted",
+            # taking every descendant with it -- observed once: one
+            # settle killed generator 0/3 and all generation with it). None is
+            # generate()'s documented "no completion" return; the caller that
+            # requested the cancel is gone anyway.
+            entry.future.set_result(None)
+
+    def rank0_settle_aborted(self, request_id: str) -> bool:
+        """RANK 0: settle the future + DP reservation of an engine-aborted request.
+
+        An aborted request never comes back through ``process_finished_requests``,
+        so its future and router reservation must be settled here. Whoever pops
+        the future owns the release: if the engine finished the request in the
+        same burst (race), the future is already gone and nothing is done.
+        """
+        entry = self._rank0_generation_futures.pop(request_id, None)
+        if entry is None:
+            return False
+        if not entry.future.done():
+            # See rank0_discard_future: .cancel() here is actor-fatal.
+            entry.future.set_result(None)
+        if self._rank0_dp_router is not None:
+            self._rank0_dp_router.release(request_id)
+        return True
+
+    def rank0_route(
+        self, requests: list[GenerationRequest]
+    ) -> list[list[GenerationRequest]]:
+        """RANK 0: pick which DP rank serves each queued request.
+
+        Returns a fixed-length (``dp_degree``) list; index == DP rank. Each rank
+        later admits only its own slice. With a single DP rank, everything goes
+        to DP rank 0; otherwise ``IntraGeneratorRouter`` reserves a DP rank per
+        request and that reservation is released when the request's completion
+        resolves.
+        """
+        requests_per_dp_rank: list[list[GenerationRequest]] = [
+            [] for _ in range(self._dp_degree)
+        ]
+        for request in requests:
+            if self._rank0_dp_router is None:
+                dp_rank = 0
+            else:
+                # Pick a DP rank for this request, and increment this DP rank's
+                # load by 1 (i.e. measured by request count).
+                dp_rank = self._rank0_dp_router.reserve(
+                    request.request_id,
+                    routing_session_id=request.routing_session_id,
+                )
+            requests_per_dp_rank[dp_rank].append(request)
+
+        return requests_per_dp_rank
+
+    def rank0_stamp_min_policy_version(
+        self,
+        requests_per_dp_rank: list[list[GenerationRequest]],
+        policy_version: int,
+    ) -> None:
+        """RANK 0: stamp the admitted (sampling) version on every future in this STEP
+        decision, across all DP ranks. Rank 0 owns the futures regardless of which DP
+        rank serves the request, so it stamps them all here."""
+        for dp_requests in requests_per_dp_rank:
+            for request in dp_requests:
+                self._rank0_generation_futures[
+                    request.request_id
+                ].min_policy_version = policy_version
+
+    def setup(self) -> None:
+        """One-time setup before the engine loop starts (DP>1): distribute rank 0's
+        result-fan-in port and start rank 0's drain task.
+
+        All ranks call this so the broadcast over the all-ranks ``_broadcast_group``
+        completes; only TP rank 0 keep the port.
+        """
+        if self._dp_degree == 1:
+            return
+
+        # rank 0 opens the channel and keeps the receiving end; it broadcasts only
+        # the sending port to the peers.
+        if self._rank == 0:
+            port, self._rank0_result_receiver = Channel.open()
+            # Monarch Port objects need cloudpickle, so we cloudpickle it into bytes
+            # first. Otherwise, broadcast_object_list will attempt to pickle the
+            # port object with stdlib pickle and result in error.
+            container = [cloudpickle.dumps(port)]
+        else:
+            container = [None]
+        dist.broadcast_object_list(
+            container, src=0, group=self._broadcast_group, device=torch.device("cpu")
+        )
+        assert container[0] is not None
+        # Only peer TP rank 0s send completions to global rank 0, so only they
+        # keep the port. Global rank 0 resolves locally and tp_rank!=0 produce
+        # no outputs.
+        if self._rank != 0 and self._tp_rank == 0:
+            self._result_port = cloudpickle.loads(container[0])
+        if self._rank == 0:
+            self._rank0_drain_task = asyncio.create_task(self._rank0_drain_results())
+
+    def process_finished_requests(
+        self, request_outputs: list[RequestOutput], policy_version: int
+    ) -> None:
+        """TP rank 0s send finished completions to global rank 0 after each
+        ``engine.step()``:
+          - Global Rank 0 resolves its own DP replica's completions locally;
+          - every other TP rank 0 sends them over the port to global rank 0's drain
+            task.
+          - Other ranks hold no finished outputs and do nothing.
+        """
+        if self._tp_rank != 0:
+            return
+
+        completions = self._build_completions(request_outputs, policy_version)
+        self._finished_count += len(completions)
+        if self._rank == 0:
+            self._rank0_resolve_futures(completions)
+        elif completions:
+            self._result_port.send(completions)
+
+    def _build_completions(
+        self, request_outputs: list[RequestOutput], policy_version: int
+    ) -> list[tuple[str, Completion, _RequestMetricsInputs]]:
+        """Turn finished ``RequestOutput``s into ``(request_id, Completion, metrics_inputs)``."""
+        completions: list[tuple[str, Completion, _RequestMetricsInputs]] = []
+        for request_output in request_outputs:
+            # We enforce n=1 in sampling params -> exactly one CompletionOutput per finished request
+            # Here we just sanity check it (a single engine.step may still finish several requests).
+            if len(request_output.outputs) != 1:
+                raise ValueError(
+                    f"expected n=1 (one sample per request), got "
+                    f"{len(request_output.outputs)} for {request_output.request_id}"
+                )
+
+            # get logprobs
+            completion_output = request_output.outputs[0]
+            topk = None
+            if isinstance(completion_output.logprobs, FlatLogprobs):
+                token_logprobs, topk = _split_flat_logprobs(completion_output.logprobs)
+            else:
+                token_logprobs = [
+                    next(iter(logprob_dict.values())).logprob
+                    for logprob_dict in completion_output.logprobs
+                ]
+
+            completions.append(
+                (
+                    request_output.request_id,
+                    Completion(
+                        # NOTE: min_policy_version is a PLACEHOLDER here, set equal to max (the finish
+                        # version). The serving rank has no access to the future that holds the true
+                        # admitted version, so rank 0 REPLACES this with the real value in
+                        # _rank0_resolve_futures. min == max here ONLY until that replacement.
+                        min_policy_version=policy_version,
+                        max_policy_version=policy_version,
+                        request_id=request_output.request_id,
+                        token_ids=list(completion_output.token_ids),
+                        token_logprobs=token_logprobs,
+                        finish_reason=completion_output.finish_reason,
+                        stop_reason=getattr(completion_output, "stop_reason", None),
+                        topk=topk,
+                    ),
+                    _extract_request_metrics_inputs(request_output),
+                )
+            )
+        return completions
+
+    def _rank0_resolve_futures(
+        self, completions: list[tuple[str, Completion, _RequestMetricsInputs]]
+    ) -> None:
+        """RANK 0: build each completion's metrics (the only place that knows the
+        request's ``metrics_prefix``), then resolve its future.
+
+        TODO: metrics are built in two phases -- a DP-leader produces the raw
+        ``_RequestMetricsInputs`` alongside the ``Completion``, and rank 0
+        finalizes ``completion.metrics`` in place here, where it has the
+        ``inflight_requests_at_completion`` count. Consider unifying into a
+        single build step once that count can travel with (or be derived
+        without) the rank-0 future bookkeeping.
+        """
+        for request_id, completion, metrics_inputs in completions:
+            # Compare with peer finished counts to detect results in transit.
+            # Cancelled results may arrive after their reservation was released.
+            dp_rank = (
+                self._rank0_dp_router._reservations.get(request_id)
+                if self._rank0_dp_router is not None
+                else 0
+            )
+            if dp_rank is None:
+                self._late_result_count += 1
+            else:
+                self._received_counts[dp_rank] += 1
+            # in flight when this one finished (includes itself; counted before the pop)
+            inflight_requests_at_completion = float(len(self._rank0_generation_futures))
+            generation_future = self._rank0_generation_futures.get(request_id)
+            if generation_future is None:
+                # A peer can finish and send before the abort broadcast, while
+                # rank 0 settles the abort before receiving that peer's output.
+                # The abort already released the reservation. Ignore only this
+                # late result, preserving the rest of the completion batch.
+                logger.debug("Ignoring settled generation result %s", request_id)
+                continue
+            if generation_future.future.done():
+                # Cancellation of the endpoint's await may cancel its future.
+                # Never let set_result kill the shared peer-result drain.
+                if self._rank0_dp_router is not None:
+                    self._rank0_dp_router.release(request_id)
+                del self._rank0_generation_futures[request_id]
+                continue
+
+            # Replace the placeholder min (the builder set min == max) with the true admitted
+            # version stamped on the future at admission.
+            completion.min_policy_version = generation_future.min_policy_version
+            metrics_prefix = generation_future.metrics_prefix
+
+            metrics = _prepare_generation_request_metrics(
+                metrics_inputs, prefix=metrics_prefix
+            )
+            for metric_type in [m.Max, m.Mean]:
+                metrics.append(
+                    m.Metric(
+                        f"{metrics_prefix}/inflight_requests_at_completion",
+                        metric_type(inflight_requests_at_completion),
+                    )
+                )
+            completion.metrics = metrics
+
+            # Keep the future registered until every fallible preparation step
+            # succeeds, so loop failure can still settle it with an exception.
+            if self._rank0_dp_router is not None:
+                self._rank0_dp_router.release(request_id)
+            del self._rank0_generation_futures[request_id]
+            generation_future.future.set_result(completion)
+
+    async def _rank0_drain_results(self) -> None:
+        """RANK 0 background task which receives and resolves completions pushed
+        by peer TP rank 0s.
+        """
+        try:
+            while True:
+                completions = await self._rank0_result_receiver.recv()
+                self._rank0_resolve_futures(completions)
+        except Exception as exc:
+            # This task remains referenced until shutdown, so asyncio's default
+            # "exception was never retrieved" reporting may arrive hours late.
+            logger.exception("generator peer result drain crashed")
+            self.fail_generation_futures(exc)
+            raise
+
+    def fail_generation_futures(self, exc: BaseException) -> None:
+        """RANK 0: fail every unresolved generation future after an exception or
+        teardown (no-op elsewhere, where the map is empty)."""
+        for generation_future in self._rank0_generation_futures.values():
+            if not generation_future.future.done():
+                generation_future.future.set_exception(exc)
+        self._rank0_generation_futures.clear()
+        if self._rank0_dp_router is not None:
+            self._rank0_dp_router.release_all()
+
+    async def shutdown(self) -> None:
+        """Stop rank 0's drain task, if any (no-op elsewhere)."""
+        if self._rank0_drain_task is not None:
+            self._rank0_drain_task.cancel()
+            try:
+                await self._rank0_drain_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._rank0_drain_task = None
+
+
+def use_assigned_physical_gpu() -> None:
+    """Bind this process to ``RL_GPU_INDEX`` (set by PerHostProvisioner with
+    physical_ordinal) before any CUDA use: every GPU stays visible, so cuda:k is
+    physical GPU k. vLLM's external launcher takes its device from LOCAL_RANK."""
+    gpu_index = os.environ.get("RL_GPU_INDEX")
+    if gpu_index is None:
+        return
+    os.environ["LOCAL_RANK"] = gpu_index
+    torch.cuda.set_device(int(gpu_index))
+    # vLLM's uniproc rendezvous otherwise binds port 0, releases it, then binds
+    # the TCPStore: sibling packed engines (and any other socket drawing from
+    # the ephemeral range) can take it in between -> EADDRINUSE.
+    # A per-GPU base below the ephemeral range removes the race.
+    os.environ.setdefault("VLLM_PORT", str(20000 + 100 * int(gpu_index)))
+
+
+class VLLMGenerator(Actor, Configurable):
+    """vLLM engine to drive concurrent `generate` calls through one SPMD engine loop.
+
+    The controller fires independent calls (`generate`, `pull_model_state_dict`, `close`).
+    Rank 0 processes them, enqueue a `LoopDecision` and awaits a future. One background `_engine_loop` per rank
+    consumes the queue and executes the action. Rank 0 resolves each future when its request finishes and return
+    the result back to the controller.
+
+    Notice that vLLM `engine.step`, which is a TP collective, and the request-intake are decoupled, so a new request
+    can join mid-flight, instead of waiting for the current batch to drain.
+
+    One loop iteration, RequestDispatcher is used to dispatch requests to different ranks, and collect results.
+    Take DP=1, TP=2 for example, after the controller fired generate(prompt_0) and generate(prompt_1):
+
+        # request intake in `generate` takes a prompt, puts in a queue, releases control back to the controller
+        generate(prompt_0): enqueue prompt_0, await gen_future_0   ┐ rank 0 owns the queue + futures
+        generate(prompt_1): enqueue prompt_1, await gen_future_1   ┘ (other ranks are no-op)
+
+        # meanwhile, the engine-loop, which is its own coroutine, is continuously running.
+        rank 0   _decide_next_action -> LoopDecision(STEP, [prompt_0, prompt_1])─┐  broadcast_object_list (gloo)
+        rank 1   (blocked inside the broadcast) ─────────────────────────────────┘  decision from rank0 is broadcast
+
+        # The loop now executes the decision. In this example: STEP.
+        ALL      add_request(prompt_0), add_request(prompt_1)
+        ALL      engine.step() * max_engine_steps_between_decisions # N step burst before a new decision
+
+        # resolve the future, waking up `generate` so it returns the result to the controller.
+        # Note that prompt_1 can be done before prompt_0. The result is per request, not per batch.
+        rank 0   request_dispatcher.process_finished_requests -> prompt_1 done? gen_future_1.set_result(Completion)
+        rank 1   request_dispatcher.process_finished_requests -> no-op (tp_rank != 0, holds no futures)
+
+    For DP>1, the requests will be routed among DPs first. See RequestDispatcher's docstring for more details.
+
+    A weight sync rides the same loop: `pull_model_state_dict` queues a `LoopDecision(LoopAction.PULL_MODEL_STATE_DICT)` applied
+    between step bursts. The engine does NOT drain in-flight requests first ("hotswap"). This behavior can be changed
+    on the controller side, by blocking new requests until the engine is drained.
+
+    Args:
+        config: Generator-specific configuration.
+        model_spec: TorchTitan model specification.
+        model_path: Path to the HF model checkpoint.
+        compile_config: Per-layer torch.compile config shared with the
+            trainer so both sides compile identically.
+        max_num_seqs: vLLM's upper bound on concurrently scheduled sequences (vLLM admits fewer if KV
+            is tight); also sets the CUDA-graph capture sizes.
+        output_dir: Structured-logger output directory.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        """Generator actor configuration.
+        TODO: Expose a EngineConfig field to passing config to vLLM Engine"""
+
+        parallelism: InferenceParallelismConfig = field(
+            default_factory=InferenceParallelismConfig
+        )
+        """Parallelism configuration for the vLLM engine."""
+
+        intra_generator_router: IntraGeneratorRouter.Config = field(
+            default_factory=IntraGeneratorRouter.Config
+        )
+        """In-mesh DP routing config: how rank 0 partitions requests across the
+        engine's data-parallel ranks (no effect when data_parallel_degree == 1,
+        where there is a single DP rank)."""
+
+        sampling: SamplingConfig = field(default_factory=SamplingConfig)
+        """Default sampling parameters for generation."""
+
+        override: OverrideConfig = field(default_factory=OverrideConfig)
+        """Config overrides (e.g. ``torchtitan.overrides.fused_swiglu``) applied to
+        this generator's model spec after ``update_from_config`` and before build.
+        Separate from the trainer's override so the two can differ."""
+
+        model_dtype: str = "bfloat16"
+        """Data type for model weights, passed directly to vLLM (auto, float16, bfloat16, float32)."""
+
+        cache_cast_linear_weights: bool = True
+        """Cache CastLinear weights in compute dtype between generator weight syncs."""
+
+        mamba_cache_dtype: str = "auto"
+        """Data type for vLLM's convolutional recurrent cache."""
+
+        mamba_ssm_cache_dtype: str = "auto"
+        """Data type for vLLM's temporal/SSM recurrent cache."""
+
+        gpu_memory_limit: float = 0.9
+        """Fraction of GPU memory to use for the vLLM engine (0.0 to 1.0)."""
+
+        kv_cache_gb: float = 0.0
+        """Fixed KV-cache size in GiB; 0 sizes it from gpu_memory_limit. On a GPU other
+        users share, vLLM's startup profiling counts their allocations as its own and can
+        size the cache negative; a fixed size skips that estimate."""
+
+        cudagraph: VLLMCudagraphConfig = field(default_factory=VLLMCudagraphConfig)
+        """CUDA graph capture settings for the vLLM engine."""
+
+        checkpoint: CheckpointManager.Config = field(
+            default_factory=CheckpointManager.Config
+        )
+        """Controls whether the vLLM wrapper loads initial HF weights.
+        In the RL loop this should stay disabled (default ``enable=False``)
+        because weights arrive from TorchStore. For standalone inference,
+        set ``enable=True`` and ``initial_load_in_hf=True``."""
+
+        debug: DebugConfig = field(default_factory=DebugConfig)
+        """Debug and determinism settings."""
+
+        backend: Literal["torchtitan_wrapper", "vllm_native"] = "torchtitan_wrapper"
+        """Which vLLM model backend to use. ``torchtitan_wrapper`` (default) wraps
+        the torchtitan model class and syncs sharded weights directly. Use
+        ``vllm_native`` for architectures whose generation needs kernels the
+        wrapper lacks (e.g. Qwen3.5 Gated DeltaNet: recurrent decode + chunked
+        prefill); vLLM resolves its native model class and weights are synced via
+        the model's ``state_dict_adapter`` (torchtitan -> HF)."""
+
+        vllm_additional_config: dict[str, Any] = field(default_factory=dict)
+        """Extra engine ``additional_config`` forwarded to vLLM on the
+        ``vllm_native`` path, e.g. ``{"gdn_prefill_backend": "triton"}``."""
+
+        vllm_skip_mm_profiling: bool = False
+        """Skip native vLLM's image/video encoder memory profile for text-only
+        workloads using multimodal checkpoints. Text model profiling remains
+        enabled. Do not enable for workloads that actually submit images/video."""
+
+        gdn_trainer_parity: bool = False
+        """torchtitan_wrapper only: run the GDN conv + recurrence on the trainer's
+        external fla kernels so the generator's PREFILL logprobs match the trainer's
+        bitwise (kills the GDN train/infer logprob tail on freshly-prefilled tokens).
+        Decode continues from the paged state but is NOT bitwise (no trainer decode
+        equivalent). Slower than the vendored path; forces generator cudagraph off
+        (the external fla chunk decode is not cudagraph-capturable). Default off."""
+
+        enable_prefix_caching: bool | None = None
+        """vLLM prefix caching. ``None`` uses vLLM's default, which is OFF for
+        hybrid GDN models (``is_prefix_caching_supported`` is False). Set ``True``
+        to force it on: for the multi-turn coding agent (context grows each turn)
+        this reuses the shared prefix across turns instead of re-prefilling the full
+        prompt every turn. For GDN, vLLM runs it in experimental ``align`` mode; a
+        local smoke measured ~2x prefill with byte-identical outputs vs no caching."""
+
+        max_engine_steps_between_decisions: int = 16
+        """Controls how many `engine.step()` calls the `engine_loop` performs before processing a new decision.
+        Every generation call is queued for execution by the `engine_loop`. A higher value enables buffering
+        of more requests to avoid a prefill between every engine decode step, which is inefficient."""
+
+        cpu_staged_weight_pull: bool = False
+        """torchtitan_wrapper only: pull weights into a persistent CPU copy, then copy
+        it into the live model, instead of RDMA-writing GPU params directly. Needed for
+        several single-GPU generators per host: monarch before 2026-08 ignores
+        ``CUDA_VISIBLE_DEVICES`` when picking the NIC for GPU memory."""
+
+        overlap_weight_fetch: bool = False
+        """Overlap the weight-pull FETCH (network -> staging buffer) with ongoing
+        generation, so only the APPLY (staging -> live model) pauses the engine.
+        Without it, a pull is one engine-loop decision that blocks generation for the
+        whole fetch+apply. With it, the loop starts the fetch as a background task,
+        keeps issuing STEP bursts (generation continues) until the fetch completes,
+        then applies. The fetch writes a SEPARATE staging buffer (never the live
+        weights), so in-flight decodes keep reading consistent weights. Off (default)
+        keeps the historical blocking pull. Same idea as a production async sampler's
+        fetch-on-thread / apply-in-loop split. NOTE: pending multi-GPU validation of the
+        collective apply coordination across TP ranks."""
+
+        # TODO: check if we should put these under WeightSyncConfig
+        reset_prefix_cache_on_weight_sync: bool = True
+        """Drop the prefix cache when weights change so new requests don't reuse KV computed under the old
+        weights. vLLM only clears it while the engine is idle (true under sync training)."""
+
+        reset_running_requests_on_weight_sync: bool = True
+        """Affects requests ALREADY running at the pull: preempts them and recomputes their KV under
+        the new weights. No effect under strict-drain (engine idle at pull time); async hot-swap only.
+        Default True to avoid reusing stale-weight KV."""
+
+        salt_prefix_cache_on_weight_sync: bool = False
+        """Async hot-swap alternative to the two reset knobs above. On weight sync, keep BOTH the
+        prefix cache and every in-flight request's KV (no preempt, no re-prefill storm); instead stamp
+        each request with a per-GROUP ``cache_salt`` (the ``group=`` prefix of ``routing_session_id``;
+        see ``add_request``). A NEW group gets a fresh salt -> cache-miss vs old-weight blocks ->
+        recompute its prefix under the new weights, while an in-flight group keeps reusing its own KV.
+        Mirrors open-instruct's per-prompt ``cache_salt=base_request_id`` (its n samples share one
+        request) + ``inflight_updates_recompute_kv_cache=False``. When True the two reset knobs above
+        are bypassed."""
+
+        enable_dp_weight_broadcast: bool = False
+        """Let one rank per vLLM DP group pull its TP shard from TorchStore, then
+        broadcast that shard to its DP replicas. Dense models only; unsupported
+        layouts retain the legacy all-rank pull."""
+
+        def __post_init__(self):
+            # The generator runs vLLM full expert parallelism: vLLM forms the EP
+            # group from all DP*TP ranks, so expert_parallel_degree must equal
+            # data_parallel_degree * tensor_parallel_degree (or 1 to disable EP).
+            p = self.parallelism
+            full_ep = p.data_parallel_degree * p.tensor_parallel_degree
+            if p.expert_parallel_degree not in (1, full_ep):
+                raise ValueError(
+                    f"expert_parallel_degree ({p.expert_parallel_degree}) must be 1 "
+                    f"(no expert parallelism) or equal data_parallel_degree * "
+                    f"tensor_parallel_degree ({full_ep}) in the generator."
+                )
+
+            # Under batch_invariant an OLD-weights prefix cache surviving a weight
+            # sync must not silently poison determinism. Two acceptable policies:
+            #   - reset: drop the whole prefix cache on sync (uniformly bitwise).
+            #   - salt: per-group cache_salt keeps only STRADDLING in-flight rollouts
+            #     on old-weight KV; new groups recompute under the new weights. Within
+            #     a policy version, recurrent-BI prefix reuse is bitwise (continuation
+            #     == fresh full prefill), so only sync-straddling samples carry the
+            #     usual off-policy drift (NOT a kernel nondeterminism). This mirrors
+            #     open-instruct's inflight cache_salt and is accepted deliberately.
+            # Neither reset nor salt = a stale cache silently persists -> forbidden.
+            if (
+                self.debug.batch_invariant
+                and not self.reset_prefix_cache_on_weight_sync
+                and not self.salt_prefix_cache_on_weight_sync
+            ):
+                raise ValueError(
+                    "batch_invariant requires reset_prefix_cache_on_weight_sync=True "
+                    "or salt_prefix_cache_on_weight_sync=True so an old-weights prefix "
+                    "cache can't silently break determinism"
+                )
+            if self.salt_prefix_cache_on_weight_sync and self.debug.batch_invariant:
+                logger.warning(
+                    "batch_invariant + salt_prefix_cache_on_weight_sync: weight-sync-"
+                    "straddling in-flight samples keep old-weight KV, so their gen-vs-"
+                    "trainer logprobs are not bitwise (off-policy drift); non-straddling "
+                    "samples stay bitwise."
+                )
+            if (
+                self.reset_running_requests_on_weight_sync
+                and not self.reset_prefix_cache_on_weight_sync
+            ):
+                raise ValueError(
+                    "reset_running_requests_on_weight_sync requires "
+                    "reset_prefix_cache_on_weight_sync=True (it only matters as part of resetting the cache)"
+                )
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        model_spec: ModelSpec,
+        model_path: str,
+        compile_config: CompileConfig,
+        max_num_seqs: int,
+        output_dir: str,
+    ):
+        use_assigned_physical_gpu()
+        init_logger()
+        sl.init_structured_logger(
+            source="rl_generator",
+            output_dir=output_dir,
+            rank=current_rank().rank,
+            enable=config.debug.enable_structured_logging,
+        )
+        sl.log_trace_instant("structured_logger_started")
+
+        self.config = config
+        self.model_spec = model_spec
+
+        self._max_num_seqs = max_num_seqs
+
+        # FULL_AND_PIECEWISE runs prefill/mixed-batch attention eager via the
+        # @eager_break_during_capture decorator in rl/models/attention.py, which
+        # reads VLLM_USE_BREAKABLE_CUDAGRAPH at import time -- so the env must be
+        # set before register_to_vllm imports that module (#3709).
+        if config.cudagraph.enable and config.cudagraph.mode == "FULL_AND_PIECEWISE":
+            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+
+        self._backend = config.backend
+        native = config.backend == "vllm_native"
+        set_cast_linear_inference_cache(not native and config.cache_cast_linear_weights)
+        inner_attn = None
+        if native and os.environ.get("TT_GDN_UNIFIED_KERNEL") == "1":
+            # Opt-in: run the vLLM-native GDN layer's recurrence on TorchTitan's
+            # own fla kernels (same as the trainer) to cut train/infer drift.
+            # Must register before the vLLM engine builds the model. Default off.
+            from torchtitan.experiments.rl.models.gdn_vllm_titan import (
+                register_titan_gdn,
+            )
+
+            register_titan_gdn()
+            # The fla chunk kernel used for decode is not cudagraph-capturable
+            # (host-side chunk indexing), so force generator cudagraph off.
+            if config.cudagraph.enable:
+                logger.warning(
+                    "[gdn-titan] disabling generator cudagraph "
+                    "(TorchTitan fla GDN decode is not cudagraph-capturable)"
+                )
+                config = replace(
+                    config,
+                    cudagraph=replace(config.cudagraph, enable=False),
+                )
+                self.config = config
+        if native:
+            # vLLM resolves its native model class from config.json; weights are
+            # synced via the model's state_dict_adapter (torchtitan -> HF) in
+            # ``_pull_model_state_dict``.
+            if model_spec.state_dict_adapter is None:
+                raise ValueError(
+                    "generator.backend='vllm_native' needs the model to define a "
+                    "state_dict_adapter (torchtitan->HF) for weight sync."
+                )
+            self._sd_adapter = model_spec.state_dict_adapter(
+                model_config=model_spec.model, hf_assets_path=model_path
+            )
+        else:
+            # Register TorchTitan model + parser with vLLM
+            register_to_vllm(
+                model_spec,
+                parallelism=config.parallelism,
+                compile_config=compile_config,
+                checkpoint_config=config.checkpoint,
+                override=config.override,
+            )
+            if config.gdn_trainer_parity:
+                # Route the wrapper GDN core through the trainer's external fla conv +
+                # chunk so PREFILL logprobs match the trainer bitwise. Read at
+                # forward time (no-op unless the model has a GDN core).
+                from torchtitan.experiments.rl.models.gdn_vllm_unified import (
+                    set_trainer_parity_fla,
+                )
+
+                set_trainer_parity_fla(True)
+                # cudagraph capturability depends on which parity decode runs. Under
+                # batch-invariant mode the wrapper uses the recurrent-everywhere decode
+                # (_forward_recurrent_bi: tensor-index gather/scatter + fla triton
+                # causal_conv1d_update + fused_recurrent), which IS FULL_DECODE_ONLY-
+                # capturable and stays bitwise (verified). The non-BI chunk-parity
+                # decode is NOT (host-side chunk indexing), so keep cudagraph off there.
+                if config.cudagraph.enable and not config.debug.batch_invariant:
+                    logger.warning(
+                        "[gdn-unified] disabling generator cudagraph "
+                        "(non-BI chunk-parity fla decode is not cudagraph-capturable)"
+                    )
+                    config = replace(
+                        config,
+                        cudagraph=replace(config.cudagraph, enable=False),
+                    )
+                    self.config = config
+                # Prefix caching: the recurrent-everywhere BI decode restores a reused
+                # prefix's conv+ssm state from vLLM's paged cache and CONTINUES the fla
+                # recurrence, which is bitwise-equal to a fresh full prefill (the
+                # recurrence is causal so the boundary state is identical). Keep it on
+                # under batch-invariant mode. The non-BI chunk-parity path has no
+                # bitwise continuation (a reused prefix routes to the vendored fallback),
+                # so disable prefix cache only there.
+                if config.enable_prefix_caching and not config.debug.batch_invariant:
+                    logger.warning(
+                        "[gdn-unified] disabling prefix caching "
+                        "(non-BI chunk-parity has no bitwise continuation path)"
+                    )
+                    config = replace(config, enable_prefix_caching=False)
+                    self.config = config
+            # Set vLLM environment variables from config before any vLLM init.
+            # first_attention handles hybrid models (linear + full attention).
+            attn_config = model_spec.model.first_attention
+            if attn_config is None:
+                raise ValueError(
+                    "Model has no full-attention layer for the torchtitan wrapper."
+                )
+            inner_attn = attn_config.inner_attention
+            assert isinstance(
+                inner_attn,
+                (VarlenAttention.Config, FlexAttention.Config),
+            ), "Only varlen and flex attention backends are allowed."
+
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+        set_batch_invariance(config.debug.batch_invariant)
+        if config.debug.batch_invariant:
+            # batch_invariant_ops (via set_batch_invariance) covers
+            # mm/addmm/_log_softmax/mean but not bmm; the MoE router gate lowers
+            # to bmm in the vLLM inference graph, so override it generator-side.
+            patch_bmm_for_batch_invariance()
+            # The vLLM v2 logprob Triton kernel bypasses the aten overrides above;
+            # route it through trainer's function to match the trainer exactly.
+            force_logprobs_fn_for_batch_invariance()
+            # Shrink the BI persistent-matmul M-tile for small M (decode) -- the mm is
+            # ~70% of BI decode time and wastes a 128-row tile on decode's small M.
+            # Bitwise-identical (BLOCK_SIZE_K unchanged); large-M prefill unchanged.
+            patch_matmul_for_small_m_batch_invariance()
+
+        self._set_determinism(config.debug)
+
+        self.model_path = model_path
+
+        # Build vLLM engine
+        enable_ep = config.parallelism.expert_parallel_degree > 1
+        engine_kwargs = dict(
+            # ``model`` is the path to the HF checkpoint directory: vLLM uses it
+            # for tokenizer assets + safetensors shards. On the torchtitan_wrapper
+            # path the config is sourced from ModelSpec via a config_format parser
+            # (set below); on the vllm_native path vLLM reads config.json there.
+            model=model_path,
+            trust_remote_code=True,
+            dtype=config.model_dtype,
+            tensor_parallel_size=config.parallelism.tensor_parallel_degree,
+            data_parallel_size=config.parallelism.data_parallel_degree,
+            # NOTE: Monarch launches the generator workers and sets the torch
+            # elastic distributed env; with external_launcher, vLLM uses that
+            # world to build its process groups. vLLM does not take an
+            # explicit EP degree: when this boolean is set, it converts all
+            # DP * TP ranks into the expert-parallel group for MoE layers.
+            enable_expert_parallel=enable_ep,
+            # Monarch already spawned TP workers via proc mesh. "external_launcher"
+            # tells vLLM to run one worker per process (no subprocess spawning)
+            distributed_executor_backend="external_launcher",
+            gpu_memory_utilization=config.gpu_memory_limit,
+            enforce_eager=not config.cudagraph.enable,
+            # Enables RequestOutput.metrics, so generator metrics can be returned
+            disable_log_stats=False,
+            mamba_cache_dtype=config.mamba_cache_dtype,
+            mamba_ssm_cache_dtype=config.mamba_ssm_cache_dtype,
+        )
+        if config.kv_cache_gb:
+            engine_kwargs["kv_cache_memory_bytes"] = int(config.kv_cache_gb * 2**30)
+        engine_kwargs["max_model_len"] = model_spec.model.max_seq_len
+        engine_kwargs["max_num_seqs"] = self._max_num_seqs
+        # vLLM rejects requests asking for more than max_logprobs (default 20).
+        if config.sampling.num_topk_logprobs > 20:
+            engine_kwargs["max_logprobs"] = config.sampling.num_topk_logprobs
+        has_gdn_layers = any(
+            getattr(layer, "delta_net", None) is not None
+            for layer in getattr(model_spec.model, "layers", ())
+        )
+        max_num_batched_tokens = _resolve_max_num_batched_tokens(
+            max_model_len=model_spec.model.max_seq_len,
+            has_gdn_layers=has_gdn_layers,
+            prefix_caching_enabled=config.enable_prefix_caching is True,
+            gdn_trainer_parity=config.gdn_trainer_parity,
+        )
+        if max_num_batched_tokens is not None:
+            engine_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
+        # None -> vLLM default (OFF for hybrid GDN); True forces experimental
+        # 'align'-mode prefix caching so multi-turn rollouts reuse the shared prefix.
+        if config.enable_prefix_caching is not None:
+            engine_kwargs["enable_prefix_caching"] = config.enable_prefix_caching
+        # Continuous batching requires FCFS scheduling: admission order must equal the
+        # broadcast order on every rank
+        engine_kwargs["scheduling_policy"] = "fcfs"
+        # FA2 requires block_size to be a multiple of 256, and FA2 is what vLLM
+        # falls back to whenever the capability-appropriate FlashAttention kernels
+        # are absent. Key the override on the kernels actually being loadable, not
+        # on raw capability: `has_cuda_capability` is a >= test, so a bare (9, 0)
+        # check also skips it on Blackwell, where FA3 has no kernels at all and FA4
+        # needs a separate flash-attn-4 install -- without which the engine dies at
+        # startup with "Paged KV cache block size must be divisible by 256".
+        if not _flash_attention_kernels_available():
+            engine_kwargs["block_size"] = 256
+        if config.parallelism.tensor_parallel_degree > 1:
+            # vLLM's custom all-reduce hangs under Monarch's external_launcher at
+            # TP>1; fall back to NCCL all-reduce.
+            engine_kwargs["disable_custom_all_reduce"] = True
+        # Forward extra vLLM engine config on both native and torchtitan_wrapper
+        # paths. GDN hybrids use this to pin gdn_prefill_backend=triton; leaving it
+        # at vLLM's auto default can select cutedsl/flashinfer backends that are not
+        # valid in every packaged runtime.
+        if config.vllm_additional_config:
+            engine_kwargs["additional_config"] = config.vllm_additional_config
+        # Neither generator path uses FlashInfer all-reduce (TP=1 + custom AR
+        # disabled), but vLLM imports flashinfer_all_reduce unconditionally during
+        # CudaCommunicator init, which can resolve cudart to tilelang's stub
+        # (missing cudaDeviceReset) and abort engine init. Install the no-op stub
+        # on BOTH the native and torchtitan_wrapper paths before LLMEngine init.
+        _install_flashinfer_allreduce_import_stub()
+        if native:
+            if config.vllm_skip_mm_profiling:
+                engine_kwargs["skip_mm_profiling"] = True
+            # Match the trainer's fp32 lm_head on the native generator (default on;
+            # RL_GEN_NATIVE_FP32_LMHEAD=0 to disable for A/B).
+            if os.environ.get("RL_GEN_NATIVE_FP32_LMHEAD", "1") == "1":
+                _install_fp32_native_lm_head()
+            # RL_GEN_VLLM_ATTENTION pins the backend on the native path too.
+            # vLLM's auto-selection prefers FLASHINFER on Blackwell, whose decode
+            # kernel (trtllm_batch_decode_with_kv_cache) is JIT-compiled on first
+            # use and needs an nvcc that can target the local arch; where there is
+            # none the engine dies mid-generation with "Ninja build failed".
+            _backend_override = os.environ.get("RL_GEN_VLLM_ATTENTION", "")
+            if _backend_override:
+                engine_kwargs["attention_config"] = AttentionConfig(
+                    backend=AttentionBackendEnum[_backend_override],
+                )
+            # vLLM reads config.json + resolves its native model class.
+            # Forward our cudagraph config on the native path too. Without this, vLLM
+            # defaults to O2 (inductor VLLM_COMPILE + FULL_AND_PIECEWISE); we want the
+            # cheaper, #3668-safe FULL_DECODE_ONLY (mode=NONE, no inductor, decode-only
+            # graphs). Local smoke: FULL_DECODE_ONLY = 2.5x decode with fast init and
+            # no inductor, vs FULL_AND_PIECEWISE 3.0x but slow inductor compile.
+            #
+            # RL_GEN_VLLM_DEFAULT_COMPILE=1 forwards nothing and leaves vLLM on that
+            # O2 default. The smoke that chose FULL_DECODE_ONLY measured PURE decode.
+            # Under continuous chunked prefill a mixed batch fails
+            # _is_uniform_decode, so no FULL key matches and the step runs eager:
+            # measured on one cluster at 15.3 tok/s per sequence with prefill=0
+            # against 7.9 with prefill active, i.e. the graph fires almost never in
+            # steady state. Costs an inductor compile at engine init (minutes).
+            #
+            # That default compiles every CustomOp's forward_native with inductor
+            # (custom_ops=['none']). On a B300 stack the inductor-fused
+            # native RoPE in Qwen3.5's attention drifts from eager: measured against
+            # the trainer model on 144k multi-turn decode tokens, step-1 KL k1 was
+            # 0.0017 compiled vs 0.00009 eager, which explained a 10x
+            # trainer/generator logprob gap between two clusters. Running rotary_embedding as its CUDA
+            # op ("+rotary_embedding") brings it to 0.0002 and keeps ~99% of the
+            # compiled throughput. RL_GEN_VLLM_CUSTOM_OPS overrides the list
+            # (comma-separated); set it empty to forward nothing, as before.
+            if os.environ.get("RL_GEN_VLLM_DEFAULT_COMPILE", "0") == "1":
+                custom_ops = [
+                    op
+                    for op in os.environ.get(
+                        "RL_GEN_VLLM_CUSTOM_OPS", "none,+rotary_embedding"
+                    ).split(",")
+                    if op
+                ]
+                # The allreduce+rmsnorm fusion (on for TP > 1) needs FlashInfer
+                # all-reduce, which _install_flashinfer_allreduce_import_stub disables.
+                pass_config = PassConfig(fuse_allreduce_rms=False)
+                compile_kwargs: dict[str, Any] = {"pass_config": pass_config}
+                if custom_ops:
+                    compile_kwargs["custom_ops"] = custom_ops
+                # vLLM captures graphs only up to min(2 * max_num_seqs, 512) tokens;
+                # a larger step runs with no graph, and under DP the synced graph mode
+                # is the min across ranks, so one rank's prefill tail drags every
+                # rank's decode to eager. Multi-turn steps (decodes + a prefill tail
+                # under one mamba block) mostly sit just above the default cap.
+                # 2048 covers them: 35B DP4xEP4 multi-turn -14% per-turn time, ~3.6
+                # GiB of graphs; 4096 OOMs at gpu_memory_limit 0.85. Same kernels,
+                # graph replay only. 0 keeps vLLM's default.
+                max_capture = int(
+                    os.environ.get("RL_GEN_VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE", "0")
+                )
+                if max_capture > 0:
+                    compile_kwargs["max_cudagraph_capture_size"] = max_capture
+                engine_kwargs["compilation_config"] = CompilationConfig(
+                    **compile_kwargs
+                )
+                logger.info(
+                    "[generator] RL_GEN_VLLM_DEFAULT_COMPILE=1: vLLM default "
+                    "compile (inductor VLLM_COMPILE + FULL_AND_PIECEWISE), "
+                    f"custom_ops={custom_ops or 'vLLM default'}, "
+                    f"max_cudagraph_capture_size={max_capture or 'vLLM default'}"
+                )
+            else:
+                vllm_compilation_config = config.cudagraph.get_vllm_compilation_config(
+                    max_num_seqs=self._max_num_seqs,
+                )
+                if vllm_compilation_config is not None:
+                    engine_kwargs["compilation_config"] = vllm_compilation_config
+        else:
+            # torchtitan_wrapper: build PretrainedConfig from ModelSpec (no
+            # config.json read) + pin the attention backend for the wrapper, and
+            # let vLLM capture our cudagraph. Native manages its own compilation.
+            engine_kwargs["disable_custom_all_reduce"] = True
+            engine_kwargs["config_format"] = TORCHTITAN_CONFIG_FORMAT
+            # RL_GEN_VLLM_ATTENTION overrides the backend derived from the
+            # ModelSpec. Needed for large head_dim on Blackwell: vLLM's flex backend
+            # sizes its Triton tiles from the GPU's shared memory alone
+            # (get_kernel_options: BLOCK_M=BLOCK_N=64 for bf16, halved only below
+            # 144KB), ignoring head_dim, so Qwen3.5's head_dim 256 asks for 552KB
+            # against sm_100's 227KB limit and compilation dies with
+            # "out of resource: triton_tem_fused_flex_attention".
+            _backend_override = os.environ.get("RL_GEN_VLLM_ATTENTION", "")
+            engine_kwargs["attention_config"] = AttentionConfig(
+                backend=(
+                    AttentionBackendEnum[_backend_override]
+                    if _backend_override
+                    else (
+                        AttentionBackendEnum.FLEX_ATTENTION
+                        if isinstance(inner_attn, FlexAttention.Config)
+                        else AttentionBackendEnum.CUSTOM
+                    )
+                ),
+            )
+            vllm_compilation_config = config.cudagraph.get_vllm_compilation_config(
+                max_num_seqs=self._max_num_seqs,
+            )
+            if vllm_compilation_config is not None:
+                engine_kwargs["compilation_config"] = vllm_compilation_config
+        if config.debug.seed is not None:
+            engine_kwargs["seed"] = config.debug.seed
+        engine_args = EngineArgs(**engine_kwargs)
+
+        with sl.log_trace_span("vllm_init"):
+            logger.info("Initializing LLMEngine from EngineArgs...")
+            self._engine = LLMEngine.from_engine_args(
+                engine_args, stat_loggers=[_EngineStatsLogger]
+            )
+            logger.info("vLLM rollout engine initialized")
+
+        self.policy_version = 0
+
+        # --- Continuous-batching state (see the class docstring) ---
+        self._rank = dist.get_rank()
+        # For LoopDecisions. While rank 0 has no work it waits on the condition and
+        # the other ranks sit in broadcast_object_list, so an idle generator (an eval
+        # generator between passes) must not hit gloo's default 30-minute timeout,
+        # which kills the engine loop. A crashed peer still fails fast on the closed
+        # connection, so the long timeout does not hide real failures.
+        self._broadcast_group = dist.new_group(
+            backend="gloo", timeout=timedelta(days=7)
+        )
+        self._dp_weight_broadcaster: DPWeightBroadcaster | None = None
+        # cpu_staged_weight_pull: CPU copy of the state dict reused across pulls.
+        self._cpu_pull_buffer: dict | None = None
+        # RL_NATIVE_EP_PARTIAL_PULL=1: a vllm_native expert-parallel rank pulls
+        # only its own experts, from the first pull on when the expert shapes can
+        # be read from the vLLM model.
+        self._ep_partial_pull: NativeEPPartialPull | None = None
+        if (
+            native
+            and os.environ.get("RL_NATIVE_EP_PARTIAL_PULL", "0") == "1"
+            and config.parallelism.expert_parallel_degree > 1
+        ):
+            expert_range = local_expert_range(self._get_model())
+            if expert_range is not None:
+                # RL_NATIVE_PINNED_EXPERT_BUFFERS=1: fetch the local experts into
+                # the same page-locked buffers every pull (faster H2D in apply).
+                pinned = os.environ.get("RL_NATIVE_PINNED_EXPERT_BUFFERS", "0") == "1"
+                self._ep_partial_pull = NativeEPPartialPull(
+                    *expert_range,
+                    dims=expert_dims(self._get_model()),
+                    pin_buffers=pinned,
+                )
+            elif self._rank == 0:
+                logger.warning(
+                    "RL_NATIVE_EP_PARTIAL_PULL=1 but no contiguous local expert "
+                    "range was found; pulling the full state dict"
+                )
+        # RL_NATIVE_TP_PARTIAL_PULL=1: a vllm_native TP rank pulls only its TP
+        # slice of the column-/row-/vocab-parallel non-expert weights (from the
+        # second pull on; the first, full pull records the shapes).
+        self._tp_partial_pull: NativeTPPartialPull | None = None
+        if (
+            native
+            and os.environ.get("RL_NATIVE_TP_PARTIAL_PULL", "0") == "1"
+            and config.parallelism.tensor_parallel_degree > 1
+        ):
+            tp_rules = tp_rules_from_vllm_model(self._get_model())
+            if tp_rules is not None:
+                self._tp_partial_pull = NativeTPPartialPull(tp_rules)
+            elif self._rank == 0:
+                logger.warning(
+                    "RL_NATIVE_TP_PARTIAL_PULL=1 but the native model has no "
+                    "safe TP slicing; pulling full non-expert weights"
+                )
+        # RL_NATIVE_FAST_APPLY=1: load stacked experts slab-by-slab through the
+        # FusedMoE loader and fuse GatedDeltaNet q/k/v into reused buffers, instead
+        # of to_hf's gate_up concat + the EP full-size embed (bitwise the same
+        # parameters; see native_fast_apply.py).
+        self._fast_apply: NativeFastApply | None = None
+        if native and os.environ.get("RL_NATIVE_FAST_APPLY", "0") == "1":
+            # The expert / GatedDeltaNet key layout it relies on is Qwen3.5's.
+            if type(self._sd_adapter).__name__ == "Qwen35StateDictAdapter":
+                self._fast_apply = NativeFastApply(
+                    self._get_model(),
+                    ep=self._ep_partial_pull,
+                    tp=self._tp_partial_pull,
+                )
+            elif self._rank == 0:
+                logger.warning(
+                    "RL_NATIVE_FAST_APPLY=1 only supports Qwen3.5; using the "
+                    f"default apply for {type(self._sd_adapter).__name__}"
+                )
+        if config.enable_dp_weight_broadcast:
+            unsupported_reason = dp_weight_broadcast_unsupported_reason(
+                data_parallel_degree=config.parallelism.data_parallel_degree,
+                expert_parallel_degree=config.parallelism.expert_parallel_degree,
+            )
+            if unsupported_reason is not None:
+                if self._rank == 0:
+                    logger.warning(
+                        "DP weight broadcast requested but unavailable: %s; "
+                        "using the legacy all-rank TorchStore pull",
+                        unsupported_reason,
+                    )
+            else:
+                self._dp_weight_broadcaster = DPWeightBroadcaster(
+                    dp_group=get_dp_group(),
+                    control_group=self._broadcast_group,
+                    expected_dp_degree=config.parallelism.data_parallel_degree,
+                )
+        self._engine_loop_condition = (
+            asyncio.Condition()
+        )  # Signals to wake up when there is work
+
+        # --- Request dispatch ---
+        # The dispatcher owns the DP/TP rank layout and the request dispatch /
+        # completion fan-in (see its docstring).
+        self._request_dispatcher = RequestDispatcher(
+            rank=self._rank,
+            parallelism=config.parallelism,
+            broadcast_group=self._broadcast_group,
+            vllm_parallel_config=self._engine.vllm_config.parallel_config,
+            intra_generator_router=config.intra_generator_router,
+        )
+
+        # Engine-loop INBOX (rank 0): requests the controller submits; the loop reads them to decide.
+        self._queued_generation_requests: list[GenerationRequest] = []
+        # RANK 0: ids cancelled after admission; drained into the next STEP
+        # decision's abort_request_ids broadcast.
+        self._pending_abort_request_ids: list[str] = []
+        self._model_state_dict_pull_request: ModelStateDictPullRequest | None = None
+        self._close_request: CloseRequest | None = None
+
+        self._pull_model_state_dict_future: asyncio.Future[int] | None = None
+
+        # overlap_weight_fetch: the in-flight background fetch task (None when idle) and
+        # the version it is fetching. The loop keeps stepping (generating) while this is
+        # in flight, then applies its result. Each rank owns its own task.
+        self._pending_weight_fetch: asyncio.Task | None = None
+        self._pending_weight_fetch_version: int = 0
+
+        # Background asyncio.Task running _engine_loop; None until the first generate/pull starts it.
+        self._engine_loop_task: asyncio.Task | None = None
+        self._load_log_at = 0.0
+        self._admitted_count = 0
+        self._admitted_prompt_tokens = 0
+
+        logger.info("Generator initialized with vLLM engine")
+
+    @staticmethod
+    def _set_determinism(debug: DebugConfig) -> None:
+        """Apply deterministic flags for the generator.
+
+        The generator doesn't use torchtitan's ParallelDims, so we apply
+        the deterministic flags directly instead of using set_determinism().
+        """
+        if debug.deterministic:
+            torch.use_deterministic_algorithms(
+                True, warn_only=debug.deterministic_warn_only
+            )
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+        if debug.seed is not None:
+            torch.manual_seed(debug.seed)
+
+    def _get_model(self):
+        """Access the model from the vLLM engine.
+        Returns a VLLMModelWrapper instance.
+        """
+        return self._engine.model_executor.driver_worker.get_model()
+
+    @endpoint
+    async def sync_log_step(self, step: int, relative_step: int | None = None) -> None:
+        """Sync the structured-logger step counter from the controller."""
+        sl.set_step(step, relative_step=relative_step)
+
+    @endpoint
+    @sl.log_trace_span("generate")
+    async def generate(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        request_id: str,
+        routing_session_id: str,
+        sampling_config: SamplingConfig | None = None,
+        metrics_prefix: str = "generator",
+    ) -> Completion | None:
+        """Generates one completion for one prompt.
+
+        Returns the `Completion` on rank 0 and `None` on followers. The completion carries its
+        own per-generation metrics (`Completion.metrics`), which the controller attaches to the
+        rollout turn.
+
+        Args:
+            prompt_token_ids: One tokenized prompt `[token_ids]`.
+            request_id: Unique id for this request, echoed on the `Completion`.
+            routing_session_id: Stable session key for in-mesh DP routing.
+            sampling_config: Optional per-call override for the generator's
+                default SamplingConfig.
+            metrics_prefix: Namespace prepended to every metric key on the returned
+                `Completion` (default ``"generator"``). Callers that need to keep streams
+                separate, e.g. ``"validation/generator"``, can override it.
+
+        Example:
+
+            completion = await generator.generate.call(
+                [1, 2, 3], request_id="step=3/group=0/sample=0/turn=0",
+            )
+            # rank 0 -> Completion(token_ids=[...], metrics=[Metric("generator/queue_time_ms", ...)]);
+            # followers -> None
+        """
+
+        # Starting requires asyncio, which isn't available in the sync __init__.
+        # Start on first call; no-op after.
+        await self._ensure_engine_loop()
+
+        # Only rank 0 owns the queue + futures moving forward.
+        if self._rank != 0:
+            return None
+
+        sampling = (
+            sampling_config if sampling_config is not None else self.config.sampling
+        )
+
+        # `_engine_loop_condition` wakes the engine loop, if asleep, when a new request is added.
+        async with self._engine_loop_condition:
+            # Register the future before enqueueing; the engine loop resolves it.
+            generation_future = self._request_dispatcher.rank0_register_future(
+                request_id, metrics_prefix
+            )
+
+            # Add the request to the queue; the engine loop will admit + process it.
+            self._queued_generation_requests.append(
+                GenerationRequest(
+                    request_id=request_id,
+                    prompt_token_ids=prompt_token_ids,
+                    sampling=sampling,
+                    routing_session_id=routing_session_id,
+                )
+            )
+            # Wakes the engine loop only if it is idle in `_decide_next_action`.
+            self._engine_loop_condition.notify()
+
+        # Await outside the lock so other generate / pull calls can proceed meanwhile.
+        return await generation_future
+
+    @endpoint
+    async def cancel_generation(self, *, request_id: str) -> bool:
+        """Best-effort cancel for a caller that has given up on its request.
+
+        Drop a queued request immediately; broadcast cancellation of admitted
+        work to every engine on the next decision. Completed and already
+        cancelled requests require no further work.
+
+        Returns True when a queued request was dropped. Rank 0 owns the queue.
+        """
+        if self._rank != 0:
+            return False
+        async with self._engine_loop_condition:
+            kept = [
+                r
+                for r in self._queued_generation_requests
+                if r.request_id != request_id
+            ]
+            dropped = len(self._queued_generation_requests) - len(kept)
+            if dropped:
+                self._queued_generation_requests = kept
+                self._request_dispatcher.rank0_discard_future(request_id)
+            elif request_id in self._request_dispatcher._rank0_generation_futures:
+                # Already admitted into an engine: queue a lockstep abort. The
+                # engine-side abort is what actually frees the decode slot.
+                self._pending_abort_request_ids.append(request_id)
+                self._engine_loop_condition.notify()
+        return bool(dropped)
+
+    async def _ensure_engine_loop(self) -> None:
+        """Start the single background engine loop on first use (idempotent); runs until `close()`."""
+        if self._engine_loop_task is None:
+            self._engine_loop_task = asyncio.create_task(self._engine_loop())
+        elif self._engine_loop_task.done():
+            cause = (
+                None
+                if self._engine_loop_task.cancelled()
+                else self._engine_loop_task.exception()
+            )
+            raise RuntimeError("generator engine loop has stopped") from cause
+
+    async def _abort_requests(self, request_ids: list[str]) -> None:
+        """All ranks confirm abort before rank 0 releases request ownership."""
+        abort_error = None
+        try:
+            self._engine.abort_request(request_ids)
+        except Exception as exc:
+            abort_error = exc
+            logger.exception("engine abort_request failed")
+        failed = torch.tensor(int(abort_error is not None), dtype=torch.int32)
+        # Every rank participates even when its local abort raised; otherwise a
+        # peer could enter engine.step while the failed rank exits the loop.
+        await asyncio.to_thread(
+            dist.all_reduce,
+            failed,
+            op=dist.ReduceOp.MAX,
+            group=self._broadcast_group,
+        )
+        if failed.item():
+            raise RuntimeError(
+                "generator engine abort failed on at least one rank"
+            ) from abort_error
+        if self._rank == 0:
+            settled = sum(
+                self._request_dispatcher.rank0_settle_aborted(rid)
+                for rid in request_ids
+            )
+            logger.info(
+                "[generator] aborted %d requests (%d pending)",
+                len(request_ids),
+                settled,
+            )
+
+    @sl.log_trace_span("engine_loop")
+    async def _engine_loop(self) -> None:
+        """Non-stop loop running on all ranks to produce new tokens.
+
+        Rank 0 decides a `LoopDecision` and broadcasts it; ALL ranks apply it in
+        lockstep until CLOSE. On crash, fail every outstanding future so callers don't hang.
+
+        `_decide_next_action` is consulted once every `max_engine_steps_between_decisions` steps (a burst),
+        so new requests buffer and prefill together instead of on every step.
+
+        Example:
+            max_engine_steps_between_decisions = 16
+            check `_decide_next_action` --> "STEP"         --> run engine.step 16 times
+            check `_decide_next_action` --> "PULL_MODEL_STATE_DICT" --> run `_pull_model_state_dict`
+            check `_decide_next_action` --> "STEP"         --> run engine.step 16 times
+            check `_decide_next_action` --> "CLOSE"        --> stop
+        """
+        try:
+            # One-time dispatcher setup before the loop starts.
+            self._request_dispatcher.setup()
+            while True:
+                # Rank 0 decides next decision; followers pass None and learn from the broadcast.
+                decision = await self._decide_next_action() if self._rank == 0 else None
+
+                # Barrier(gloo, CPU): Ship rank 0's decision (incl. prompts) to every TP rank via gloo/CPU, off the
+                # NCCL stream. broadcast_object_list mutates a list in place; `to_thread` runs the
+                # blocking call in a worker so the event loop can still serve generate/pull/close.
+                # TODO(perf): overlap this broadcast with the step burst (pipeline the next decision) so
+                # gloo transfer hides behind GPU compute.
+                # TODO(perf): swap broadcast_object_list (double serialization of pickle+broadcast) for a byte
+                # broadcast, to cut pickle overhead. i.e. serialize the decision to bytes on rank 0, then broadcast.
+                # TODO: Revisit when enabling DP>1
+                decision_broadcast_container = [decision] if self._rank == 0 else [None]
+                await asyncio.to_thread(
+                    dist.broadcast_object_list,
+                    decision_broadcast_container,
+                    src=0,
+                    group=self._broadcast_group,
+                    device=torch.device("cpu"),
+                )
+                # get rank 0's broadcasted decision
+                decision = decision_broadcast_container[0]  # [num_ranks]
+
+                if decision.action is LoopAction.CLOSE:
+                    return
+
+                if decision.action is LoopAction.PULL_MODEL_STATE_DICT:
+                    await self._pull_model_state_dict(decision.pull_version)
+                    continue  # back to the start for the next decision
+
+                if decision.action is LoopAction.PULL_FETCH:
+                    # overlap_weight_fetch: each rank starts its own background fetch
+                    # into a staging buffer and returns to STEP, so generation keeps
+                    # running while weights transfer. The apply happens later, once
+                    # rank 0 sees the fetch is done and broadcasts PULL_APPLY.
+                    self._pending_weight_fetch_version = decision.pull_version
+                    self._pending_weight_fetch = asyncio.create_task(
+                        self._fetch_model_state_dict(
+                            decision.pull_version, overlap_safe=True
+                        )
+                    )
+                    continue
+
+                if decision.action is LoopAction.PULL_APPLY:
+                    # overlap_weight_fetch: the fetch is done -> apply staged weights to
+                    # the live model (the only part that pauses generation). Each rank
+                    # awaits its OWN fetch (may still be finishing) before applying.
+                    staged, get_secs, gib = await self._pending_weight_fetch
+                    self._pending_weight_fetch = None
+                    self._apply_model_state_dict(
+                        decision.pull_version, staged, get_secs=get_secs, gib=gib
+                    )
+                    continue
+
+                if decision.action is LoopAction.STEP:
+                    if decision.abort_request_ids:
+                        await self._abort_requests(list(decision.abort_request_ids))
+                    # Rank 0 owns all futures, so it stamps the admitted (min) version for the whole decision.
+                    # TODO: move under the engine_step call (register at generation_start, not admission).
+                    # The way to do it is probably to change to RequestOutputKind.CUMULATIVE and mark per token.
+                    if self._rank == 0:
+                        self._request_dispatcher.rank0_stamp_min_policy_version(
+                            decision.requests_per_dp_rank, self.policy_version
+                        )
+                    # Admit only this rank's DP replica slice. TP ranks in the same
+                    # replica compute the same _dp_rank, so they add the identical
+                    # set in the same FCFS order.
+                    local_requests = decision.requests_per_dp_rank[
+                        self._request_dispatcher._dp_rank
+                    ]
+                    if local_requests:
+                        # render_cmpl is vLLM's input pipeline (tokenize is a no-op for tokenized prompts);
+                        # the high-level entry stays resilient to vLLM internals vs vllm.inputs.tokens_input.
+                        engine_inputs = self._engine.renderer.render_cmpl(
+                            [
+                                {"prompt_token_ids": request.prompt_token_ids}
+                                for request in local_requests
+                            ]
+                        )
+                        for request, engine_input in zip(
+                            local_requests, engine_inputs, strict=True
+                        ):
+                            if self.config.salt_prefix_cache_on_weight_sync:
+                                # Salt by GROUP: routing_session_id is
+                                # "group=G/rollout=R"; take the "group=G" prefix so a
+                                # group's n samples share ONE prefix-cache namespace --
+                                # matching open-instruct's per-prompt base_request_id
+                                # (its n=samples ride one request). group_id is monotonic,
+                                # so a new group gets a fresh salt -> cache-miss old-weight
+                                # blocks -> recompute under the new weights, while an
+                                # in-flight group keeps reusing its own KV. A per-sample
+                                # salt would re-prefill the shared prompt n times.
+                                engine_input[
+                                    "cache_salt"
+                                ] = request.routing_session_id.split("/rollout=", 1)[0]
+                            sampling_params = self._build_sampling_params(
+                                request.sampling
+                            )
+                            self._engine.add_request(
+                                request_id=request.request_id,
+                                prompt=engine_input,
+                                params=self._build_sampling_params(request.sampling),
+                            )
+                            self._admitted_count += 1
+                            self._admitted_prompt_tokens += len(request.prompt_token_ids)
+
+                # Barrier (NCCL): engine.step() runs SPMD in lockstep.
+                # The step burst `max_engine_steps_between_decisions` gives the generator time to buffer
+                # new requests and avoid a prefill in between every engine decode step, which is inefficient.
+                with sl.log_trace_span("vllm_engine_step_burst"):
+                    for _ in range(self.config.max_engine_steps_between_decisions):
+                        if not self._engine.has_unfinished_requests():
+                            break
+                        with torch.no_grad():
+                            with sl.log_trace_span("vllm_engine_step"):
+                                request_outputs = self._engine.step()
+                        self._request_dispatcher.process_finished_requests(
+                            request_outputs, self.policy_version
+                        )
+                        await asyncio.sleep(0)  # let pending generate() calls enqueue
+                self._log_local_load()
+
+        except Exception as exc:
+            logger.exception("engine loop crashed; failing all outstanding futures")
+            self._fail_outstanding_futures(exc)
+            raise
+
+    def _log_local_load(self) -> None:
+        """Compare local GPU work with reservations awaiting result delivery.
+
+        Snapshots use no collective and are not simultaneous: compare sustained
+        differences. Preemption counts cover only requests still in the scheduler.
+        """
+        now = time.monotonic()
+        if now - self._load_log_at < 30:
+            return
+        self._load_log_at = now
+        dispatcher = self._request_dispatcher
+        core = getattr(self._engine.engine_core, "engine_core", None)
+        scheduler = getattr(core, "scheduler", None)
+        if scheduler is None:
+            return
+        requests = list(scheduler.requests.values())
+        lengths = [r.num_tokens for r in requests]
+        logger.info(
+            "[generator-load] dp=%d admitted=%d admitted_prompt_tokens=%d "
+            "finished=%d local_unfinished=%d running=%d waiting=%d "
+            "skipped_waiting=%d context_tokens=%d max_context=%d "
+            "live_request_preemptions=%d",
+            dispatcher._dp_rank,
+            self._admitted_count,
+            self._admitted_prompt_tokens,
+            dispatcher._finished_count,
+            self._engine.get_num_unfinished_requests(),
+            len(scheduler.running),
+            len(scheduler.waiting),
+            len(getattr(scheduler, "skipped_waiting", ())),
+            sum(lengths),
+            max(lengths, default=0),
+            sum(r.num_preemptions for r in requests),
+        )
+        router = dispatcher._rank0_dp_router
+        if router is not None:
+            logger.info(
+                "[generator-load] reserved=%s received=%s late_results=%d "
+                "intake_queued=%d",
+                [h.reserved_load for h in router._handles],
+                dispatcher._received_counts,
+                dispatcher._late_result_count,
+                len(self._queued_generation_requests),
+            )
+
+    async def _decide_next_action(self) -> LoopDecision:
+        """RANK 0: picks the next action. Sleeps until there is something to do."""
+
+        # `self._engine_loop_condition.wait_for` blocks until there is work; `notify()` rechecks
+        # the predicate. In-flight requests keep the predicate true, so they need no notify.
+        async with self._engine_loop_condition:
+            await self._engine_loop_condition.wait_for(
+                lambda: self._close_request is not None
+                or self._model_state_dict_pull_request is not None
+                # A background weight fetch keeps rank 0 issuing STEP (generation runs
+                # during the transfer) until it can broadcast PULL_APPLY.
+                or self._pending_weight_fetch is not None
+                or self._queued_generation_requests
+                or self._pending_abort_request_ids
+                # In-flight requests (on any DP rank) keep rank 0 issuing STEP.
+                or self._request_dispatcher.rank0_has_pending_futures()
+            )
+
+            if self._close_request is not None:
+                return LoopDecision(action=LoopAction.CLOSE, requests_per_dp_rank=[])
+
+            # overlap_weight_fetch: a fetch already started. Apply it once done;
+            # otherwise fall through to STEP so generation runs while it transfers.
+            if self._pending_weight_fetch is not None:
+                if self._pending_weight_fetch.done():
+                    return LoopDecision(
+                        action=LoopAction.PULL_APPLY,
+                        requests_per_dp_rank=[],
+                        pull_version=self._pending_weight_fetch_version,
+                    )
+            # A weight pull takes priority over admitting new requests. With
+            # overlap_weight_fetch, start it as a background fetch (PULL_FETCH) and keep
+            # stepping; otherwise do the blocking fetch+apply (PULL_MODEL_STATE_DICT).
+            elif self._model_state_dict_pull_request is not None:
+                return LoopDecision(
+                    action=(
+                        LoopAction.PULL_FETCH
+                        if self.config.overlap_weight_fetch
+                        else LoopAction.PULL_MODEL_STATE_DICT
+                    ),
+                    requests_per_dp_rank=[],
+                    pull_version=self._model_state_dict_pull_request.version,
+                )
+
+            # STEP: admit whatever is queued (may be empty -> just keep stepping in-flight work).
+            queued, self._queued_generation_requests = (
+                self._queued_generation_requests,
+                [],
+            )
+            aborts, self._pending_abort_request_ids = (
+                self._pending_abort_request_ids,
+                [],
+            )
+            return LoopDecision(
+                action=LoopAction.STEP,
+                requests_per_dp_rank=self._request_dispatcher.rank0_route(queued),
+                abort_request_ids=aborts or None,
+            )
+
+    def _fail_outstanding_futures(self, exc: BaseException) -> None:
+        """Fail every unresolved future after an exception or engine teardown."""
+        self._request_dispatcher.fail_generation_futures(exc)
+
+        # overlap_weight_fetch: drop any in-flight background fetch so it does not
+        # outlive the loop or leak its staging buffer.
+        if self._pending_weight_fetch is not None:
+            self._pending_weight_fetch.cancel()
+            self._pending_weight_fetch = None
+
+        if self._pull_model_state_dict_future is not None:
+            if not self._pull_model_state_dict_future.done():
+                self._pull_model_state_dict_future.set_exception(exc)
+            self._pull_model_state_dict_future = None
+            self._model_state_dict_pull_request = None
+
+    def _build_sampling_params(self, sampling: SamplingConfig) -> SamplingParams:
+        """Translate a `SamplingConfig` into vLLM `SamplingParams` (n=1).
+
+        ``seed`` and ``stop_token_ids`` are carried on the ``SamplingConfig``
+        (the controller fills ``stop_token_ids`` and the rollouter offsets
+        ``seed`` per sample), so each sample in a group is a distinct ``n=1``
+        request that stays diverse and bitwise-reproducible.
+        """
+        num_topk = sampling.num_topk_logprobs
+        topk_kwargs = {}
+        if num_topk > 0:
+            # Flat lists instead of one dict per position, and no detokenizing
+            # of the k candidates: we only keep token ids. Stops are by token id.
+            topk_kwargs = {"flat_logprobs": True, "detokenize": False}
+        return SamplingParams(
+            temperature=sampling.temperature,
+            top_p=sampling.top_p,
+            max_tokens=sampling.max_tokens,
+            n=1,  # always expects a single sample per request. Caller can call N times.
+            stop_token_ids=sampling.stop_token_ids or None,
+            seed=sampling.seed,
+            # The sampled token's logprob (for the GRPO ratio), plus the top-k
+            # when score centering asks for them.
+            logprobs=num_topk,
+            **topk_kwargs,
+            # Return each request's result once, when it is fully done, instead of streaming partial
+            # outputs as tokens arrive.
+            # TODO(async-rl): use RequestOutputKind.CUMULATIVE for exact per-token
+            #   (start_token, version) boundaries; today we keep only the per-turn min/max.
+            output_kind=RequestOutputKind.FINAL_ONLY,
+        )
+
+    @endpoint
+    @sl.log_trace_span("pull_model_state_dict")
+    async def pull_model_state_dict(self, version: int) -> None:
+        """Queues a weight pull for `version` and blocks until the engine loop has finished pulling.
+
+        NOTE: In-flight requests are NOT drained here — the endpoint never drains; a caller that wants
+        an idle engine holds off new `generate` calls until the queue drains, then calls this.
+
+        Args:
+            version: Policy version to pull
+        """
+        # TODO: if an incoming request is received while another pull request is queued
+        # we should drop the older request and pull the latest version instead
+
+        # Starting requires asyncio, which isn't available in the sync __init__.
+        # Start on first call; no-op after.
+        await self._ensure_engine_loop()
+
+        # Only rank 0 owns the queue + futures moving forward.
+        if self._rank != 0:
+            return
+
+        # A placeholder future for the engine loop to resolve once the pull has been applied.
+        pull_model_state_dict_future: asyncio.Future[
+            int
+        ] = asyncio.get_running_loop().create_future()
+
+        # `_engine_loop_condition` wakes the engine loop, if asleep, when a pull is queued.
+        async with self._engine_loop_condition:
+            self._model_state_dict_pull_request = ModelStateDictPullRequest(
+                version=version
+            )
+            self._pull_model_state_dict_future = pull_model_state_dict_future
+            self._engine_loop_condition.notify()  # wakes the engine loop only if it is idle
+
+        # Await outside the lock so other generate / pull calls can proceed meanwhile.
+        await pull_model_state_dict_future
+
+    async def _fetch_model_state_dict(
+        self, version: int, *, overlap_safe: bool, staged: dict | None = None
+    ):
+        """ALL RANKS: fetch ``version``'s weights from TorchStore into a staging buffer.
+
+        Returns ``(staged, get_secs, transfer_gib)`` for ``_apply_model_state_dict``.
+        The transfer dominates the pull: torchstore's cpu_staged path reads the remote
+        CPU snapshot over MonarchRDMA, and with many generators pulling at once the
+        per-reader bandwidth is far below the fabric line rate ([pull-timing] reports
+        the achieved GB/s -- do not assume a fixed rate).
+
+        When ``overlap_safe`` the staged buffer is SEPARATE from the live model so the
+        fetch never writes weights an in-flight decode is reading; ``_apply`` copies it
+        into the live model afterward. Native always fetches a fresh dict (already
+        separate). Wrapper fills the live state dict in place unless ``overlap_safe``,
+        in which case it stages on CPU (no extra GPU memory held during generation).
+        """
+        _t0 = time.perf_counter()
+        tp_fetch = False
+        if self._backend == "vllm_native":
+            # The native model is not a torchtitan model, so weights cannot be filled
+            # in place by FQN: pull the full state dict (no template). The result is a
+            # fresh dict, so it is already safe to fetch while generation runs.
+            ep = self._ep_partial_pull
+            ep = ep if ep is not None and ep.ready else None
+            tp = self._tp_partial_pull
+            tp_fetch = tp is not None and tp.ready
+            if tp_fetch:
+                staged = await tp.fetch("model_state_dict", ep=ep)
+            elif ep is not None:
+                staged = await ep.fetch("model_state_dict")
+            else:
+                staged = await ts.get_state_dict(
+                    "model_state_dict", direct_rdma=False
+                )
+                if self._ep_partial_pull is not None:
+                    self._ep_partial_pull.record(staged)
+            if tp is not None and not tp_fetch:
+                tp.record(staged)
+        else:
+            # Async RL uses a StorageVolume snapshot so generators never read the
+            # trainer's live GPU tensors while an optimizer step may be mutating them.
+            model = self._get_model().model
+            if staged is not None:
+                # Caller-supplied buffer (the DP-broadcast path shares one dict across
+                # fetch + broadcast + apply); fill it in place, do not rebuild.
+                pass
+            elif overlap_safe:
+                # Stage on CPU: the fetch writes this buffer (not the live GPU params
+                # a concurrent decode reads), and holds no extra GPU memory. _apply
+                # then copies CPU -> live GPU params.
+                staged = {
+                    k: v.detach().to("cpu", copy=True)
+                    for k, v in model.state_dict().items()
+                }
+            else:
+                staged = model.state_dict()
+            await ts.get_state_dict(
+                "model_state_dict",
+                user_state_dict=staged,
+                strict=False,
+                direct_rdma=False,
+            )
+        get_secs = time.perf_counter() - _t0
+        if self._rank != 0:
+            gib = 0.0
+        elif self._backend == "vllm_native" and tp_fetch:
+            # staged holds full-size tensors; count only the bytes fetched.
+            gib = self._tp_partial_pull.last_fetch_bytes / 2**30
+        else:
+            gib = _state_dict_local_gib(staged)
+        return staged, get_secs, gib
+
+    def _apply_model_state_dict(
+        self, version: int, staged, *, get_secs: float, gib: float
+    ) -> None:
+        """ALL RANKS: apply staged weights to the LIVE model (the part that pauses
+        generation), refresh caches, bump the policy version, resolve the pull future.
+        """
+        _t1 = time.perf_counter()
+        if self._backend == "vllm_native" and self._fast_apply is not None:
+            to_hf_s, load_s, experts_s = self._fast_apply.apply(
+                self._sd_adapter, staged, self._get_model().load_weights
+            )
+            _refresh_fp32_lm_head_cache(self._get_model())
+            _t3 = time.perf_counter()
+            apply_detail = (
+                f"to_hf={to_hf_s:.2f}s load_weights={load_s:.2f}s "
+                f"experts={experts_s:.2f}s fast"
+            )
+        elif self._backend == "vllm_native":
+            # Convert torchtitan layout -> HF, then let vLLM copy + TP-shard.
+            hf_state_dict = self._sd_adapter.to_hf(staged)
+            if self._ep_partial_pull is not None and self._ep_partial_pull.ready:
+                hf_state_dict = self._ep_partial_pull.embed_hf(hf_state_dict)
+            _t2 = time.perf_counter()
+            self._get_model().load_weights(hf_state_dict.items())
+            _refresh_fp32_lm_head_cache(self._get_model())
+            _t3 = time.perf_counter()
+            apply_detail = f"to_hf={_t2 - _t1:.2f}s load_weights={_t3 - _t2:.2f}s"
+        else:
+            # state_dict() returns hook-produced copies for fused modules (e.g.
+            # FusedQKVLinear's wqkv -> wq/wk/wv), so the fetch's in-place fill never
+            # reaches the real param. Re-apply via load_state_dict to run the merge
+            # hook. Non-fused params share storage with the (non-staged) dict, so
+            # reloading them is a harmless self-copy; only the fused wqkv is rebuilt.
+            # TODO: can we avoid the copy and properly load fused qkv weights?
+            model = self._get_model().model
+            model.load_state_dict(staged, strict=False)
+            _t2 = time.perf_counter()
+            refresh_cast_linear_inference_caches(model)
+            _t3 = time.perf_counter()
+            apply_detail = f"load_state_dict={_t2 - _t1:.2f}s refresh={_t3 - _t2:.2f}s"
+        if self._rank == 0:
+            gbps = gib * 1.0737 / max(get_secs, 1e-9)  # GiB -> GB, over get()
+            logger.info(
+                f"[pull-timing] get={get_secs:.2f}s apply={_t3 - _t1:.2f}s "
+                f"({apply_detail}) total={get_secs + (_t3 - _t1):.2f}s "
+                f"transfer={gib:.1f}GiB @ {gbps:.2f}GB/s"
+            )
+        self.policy_version = version
+        if self.config.salt_prefix_cache_on_weight_sync:
+            # Salt mode: keep BOTH in-flight KV and the prefix cache (no preempt, no
+            # re-prefill storm). New groups carry a per-group cache_salt (set in
+            # add_request) so they recompute their prefix under the new weights, while
+            # an in-flight group keeps reusing its own KV. Mirrors open-instruct's
+            # inflight update with inflight_updates_recompute_kv_cache=False.
+            pass
+        elif self.config.reset_prefix_cache_on_weight_sync:
+            # TODO(async-rl): consider a `flush_kv_cache_every_n_steps` flag to force-flush every N steps
+            #   (helps long generations that span many steps).
+            self._engine.reset_prefix_cache(
+                reset_running_requests=self.config.reset_running_requests_on_weight_sync,
+            )
+        gc.collect()
+
+        # Rank 0 holds the pull's future. Until this is resolved,
+        # no new requests are admitted or processed.
+        if self._rank == 0 and self._pull_model_state_dict_future is not None:
+            self._pull_model_state_dict_future.set_result(version)
+            self._pull_model_state_dict_future = None
+            self._model_state_dict_pull_request = None
+
+    @sl.log_trace_span("pull_model_state_dict_copy")
+    async def _pull_model_state_dict(self, version: int) -> None:
+        """ALL RANKS: blocking pull (fetch then apply) between engine.step bursts.
+
+        This is the default path; ``overlap_weight_fetch`` instead drives
+        ``_fetch_model_state_dict`` / ``_apply_model_state_dict`` from the engine loop
+        so generation continues during the fetch.
+        """
+        # DP-broadcast: one rank per vLLM DP group reads TorchStore and
+        # fans its shard out to the DP replicas, cutting duplicated pulls. Only the
+        # fill-in-place (torchtitan_wrapper) path is supported -- vllm_native builds a
+        # fresh dict from the store, so a non-source replica would have no template to
+        # receive into. Native and the DP1/EP configs fall back to the legacy all-rank
+        # pull. NOTE: default-off (enable_dp_weight_broadcast); the weight-sync path is
+        # battle-tested, so validate weight correctness on a GPU A/B before enabling.
+        if self._dp_weight_broadcaster is not None and self._backend != "vllm_native":
+            model = self._get_model().model
+            staged = model.state_dict()
+            timing: dict[str, float] = {}
+
+            async def _fetch() -> None:
+                (
+                    _,
+                    timing["get_secs"],
+                    timing["gib"],
+                ) = await self._fetch_model_state_dict(
+                    version, overlap_safe=False, staged=staged
+                )
+
+            def _apply() -> None:
+                self._apply_model_state_dict(
+                    version,
+                    staged,
+                    get_secs=timing.get("get_secs", 0.0),
+                    gib=timing.get("gib", 0.0),
+                )
+
+            await self._dp_weight_broadcaster.synchronize(
+                state_dict=staged,
+                fetch_from_store=_fetch,
+                apply_state_dict=_apply,
+            )
+            return
+
+        cpu_staged = None
+        if self.config.cpu_staged_weight_pull and self._backend != "vllm_native":
+            cpu_staged = self._get_cpu_pull_buffer()
+        try:
+            staged, get_secs, gib = await self._fetch_model_state_dict(
+                version, overlap_safe=False, staged=cpu_staged
+            )
+        except Exception as error:
+            if self._backend == "vllm_native":
+                raise
+            # An RDMA pull can exhaust its retries (seen with packed single-GPU
+            # generators); refetch this one over gloo into a CPU copy instead of
+            # failing the weight sync.
+            logger.warning(
+                f"[pull] RDMA pull of version {version} failed "
+                f"({type(error).__name__}: {error}); retrying over gloo"
+            )
+            cpu_staged = self._get_cpu_pull_buffer()
+            previous = os.environ.get("TORCHSTORE_RDMA_ENABLED")
+            os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
+            try:
+                staged, get_secs, gib = await self._fetch_model_state_dict(
+                    version, overlap_safe=False, staged=cpu_staged
+                )
+            finally:
+                if previous is None:
+                    os.environ.pop("TORCHSTORE_RDMA_ENABLED", None)
+                else:
+                    os.environ["TORCHSTORE_RDMA_ENABLED"] = previous
+        self._apply_model_state_dict(version, staged, get_secs=get_secs, gib=gib)
+
+    def _get_cpu_pull_buffer(self) -> dict:
+        """CPU copy of the state dict, created once and reused across pulls."""
+        if self._cpu_pull_buffer is None:
+            self._cpu_pull_buffer = {
+                k: v.detach().to("cpu", copy=True)
+                for k, v in self._get_model().model.state_dict().items()
+            }
+        return self._cpu_pull_buffer
+
+    @endpoint
+    async def close(self) -> None:
+        """Stop the engine loop, then release the vLLM engine.
+
+        Rank 0 sets `_close_request` and notifies the engine_loop to quit the while-loop.
+        Any futures the loop left unresolved are then failed, so awaiting callers get an
+        exception instead of hanging.
+
+        Engine teardown: with `external_launcher`, vLLM reuses the process group and actor
+        lifetime that Monarch owns. Calling vLLM's internal `engine_core.shutdown()` can block
+        while Monarch is also trying to stop the same actor mesh, so this endpoint only closes
+        renderer-local resources and leaves process teardown to `ProcMesh.stop()`.
+        """
+        if self._rank == 0:
+            async with self._engine_loop_condition:
+                self._close_request = CloseRequest()
+                self._engine_loop_condition.notify()  # wake the loop so it returns CLOSE
+
+        # Let the engine loop process the shutdown.
+        if self._engine_loop_task is not None:
+            try:
+                await self._engine_loop_task
+            except Exception:
+                logger.exception("engine loop raised during shutdown")
+            self._engine_loop_task = None
+
+        # Stop the result-drain task on rank 0.
+        await self._request_dispatcher.shutdown()
+
+        # The loop has stopped; fail any futures it left unresolved so awaiting callers get an
+        # exception instead of hanging.
+        self._fail_outstanding_futures(
+            RuntimeError("generator closed before the request finished")
+        )
+
+        # Shut down engine parts
+        if self._engine is not None:
+            renderer = getattr(self._engine, "renderer", None)
+            if renderer is not None:
+                logger.info("Shutting down vLLM renderer")
+                renderer.shutdown()
+            self._engine = None
+
+
+# ===================== helpers =====================
+
+
+# ---- Engine-loop inbox: requests the controller submits (picklable; broadcast in LoopDecision). ----
+
+
+@dataclass(kw_only=True, slots=True)
+class GenerationRequest:
+    """One queued `generate` call awaiting admission to the engine."""
+
+    request_id: str
+    prompt_token_ids: list[int]  # [prompt_tokens]
+    sampling: SamplingConfig
+    routing_session_id: str
+
+
+@dataclass(kw_only=True, slots=True)
+class ModelStateDictPullRequest:
+    """A queued weight pull: the policy `version` to copy from TorchStore."""
+
+    version: int
+
+
+@dataclass(kw_only=True, slots=True)
+class CloseRequest:
+    """A queued shutdown signal (no payload); the engine loop returns CLOSE when it sees one."""
+
+
+# ---- Rank-0 outbox: the future the loop resolves per generation. ----
+
+
+@dataclass(kw_only=True, slots=True)
+class GenerationFuture:
+    """A generation request's future the loop resolves with its `Completion`."""
+
+    future: asyncio.Future[Completion]
+    metrics_prefix: str
+    """Namespaces this generation's metrics (e.g. `generator` vs `validation_generator`)."""
+    min_policy_version: int = field(init=False)
+    """Policy version the request was admitted (sampled) under; the max is read at finish (see `Completion`)."""
+
+
+class LoopAction(enum.Enum):
+    """What the engine loop does each loop iteration (rank 0 decides; the choice is broadcast to all)."""
+
+    STEP = "step"
+    # run a burst of engine.step(); first admit any newly-queued requests.
+
+    PULL_MODEL_STATE_DICT = "pull_model_state_dict"
+    # pull the latest weights between bursts (fetch + apply, blocking generation)
+
+    PULL_FETCH = "pull_fetch"
+    # overlap_weight_fetch: START the background fetch (network -> staging buffer);
+    # generation keeps running via STEP while it is in flight.
+
+    PULL_APPLY = "pull_apply"
+    # overlap_weight_fetch: the background fetch is done -> apply staged weights to
+    # the live model (the only part that pauses generation).
+
+    CLOSE = "close"
+    # stop the loop
+
+
+@dataclass(kw_only=True, slots=True)
+class LoopDecision:
+    """The per-iteration decision rank 0 broadcasts so every rank acts identically.
+    This is broadcasted (pickled) in the engine_loop"""
+
+    action: LoopAction
+
+    requests_per_dp_rank: list[list[GenerationRequest]] | None = None
+    # Per-DP-rank requests to admit before a STEP burst; index == DP rank, fixed
+    # length data_parallel_degree. Each rank admits only its own DP-rank slice.
+    # (empty unless any queued)
+
+    pull_version: int | None = None
+    # set iff action is PULL_MODEL_STATE_DICT
+
+    abort_request_ids: list[str] | None = None
+    # Requests whose caller gave up (rollout death) that were ALREADY admitted
+    # into the engines. Broadcast so every rank aborts its own engine's copy in
+    # lockstep. An orphaned RUNNING request is not benign: it decodes to its
+    # full max_tokens (32K on this recipe) for nobody, squatting a decode slot
+    # for hours -- once measured at ~500 orphans against 768 slots.

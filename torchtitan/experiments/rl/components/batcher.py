@@ -1,0 +1,738 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Collects trainable `TrainingSample`s until a group-count training batch is ready, then packs it.
+`Batcher` packs a `TrainingBatch` of `[num_microbatches][dp_degree]` `TrainingMicrobatch`es;
+"""
+
+import dataclasses
+import logging
+import math
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+import torch
+
+from torchtitan.config import Configurable
+from torchtitan.experiments.rl.observability import metrics as m
+from torchtitan.experiments.rl.types import (
+    SamplerTopK,
+    TrainingBatch,
+    TrainingMicrobatch,
+    TrainingSample,
+    TrainingSampleGroup,
+)
+
+logger = logging.getLogger(__name__)
+
+_LOSS_AGGREGATIONS = frozenset({"token_mean", "prompt_mean"})
+
+# Per-field pad values + tensor dtypes for a packed row.
+_PAD_VALUES: dict[str, int | float | bool] = {
+    "input_ids": 0,  # overwritten with pad_id in __init__-bound builds
+    "labels": 0,
+    "generator_logprobs": 0.0,
+    "loss_mask": False,
+    "advantages": 0.0,
+    "policy_versions": -1,
+}
+_DTYPES: dict[str, torch.dtype] = {
+    "input_ids": torch.long,
+    "labels": torch.long,
+    "generator_logprobs": torch.float,
+    "loss_mask": torch.bool,
+    "advantages": torch.float,
+    "policy_versions": torch.long,
+}
+
+
+@dataclass(kw_only=True, slots=True)
+class BatchConfig:
+    """Batch shape parameters for the RL batcher.
+
+    TODO: Refactor the pre-training trainer to use an owned batch config
+    instead of keeping batch shape fields directly on TrainingConfig.
+    NOTE: in pretraining we would have global_batch_size. But now we have
+    num_groups_per_train_step. This will need to be addressed.
+    """
+
+    local_batch_size: int = 8
+    """Per-DP-rank microbatch size (rows per forward pass). If the number of tokens in the
+    rollouts exceed the number of rows*seq_len, a new microbatch is started.
+    If it is less, the remaining rows are padded to this size."""
+
+    seq_len: int = 2048
+    """Tokens per row (packed sequence length)."""
+
+
+class Batcher(Configurable):
+    """Accumulate `num_groups_per_train_step` groups and packs
+    `[num_microbatches][dp_degree]` `TrainingMicrobatch`es of `[local_batch_size, seq_len]`.
+
+    Example:
+        # num_groups_per_train_step=2, dp_degree=2, local_batch_size=2
+        # The trigger is 2 trainable GROUPS, regardless of how many samples/tokens each contains.
+        batcher = Batcher.Config(batch=BatchConfig(local_batch_size=2, seq_len=128)).build(
+            num_groups_per_train_step=2, dp_degree=2, pad_id=0, initial_policy_version=0,
+        )
+        _ = batcher.add_training_samples(training_sample_group=group0)  # -> None (only 1 trainable group)
+        batch = batcher.add_training_samples(training_sample_group=group1)  # -> TrainingBatch
+        # batch.microbatches: [num_microbatches][2 ranks]; each TrainingMicrobatch.token_ids: [2 rows, 128 tokens]
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        batch: BatchConfig = field(default_factory=BatchConfig)
+        per_sample_pad_multiple: int | None = None
+        """When non-zero, pad each sample to a multiple of this value
+        before packing. Used by flex attention in batch-invariant mode
+        so that block boundaries align regardless of batch composition."""
+
+        skip_zero_advantage_samples: bool = False
+        """Keep samples whose every trained token has advantage 0 out of the forward pass.
+
+        The policy-gradient surrogate is ``-advantage * ratio``, so such a sample
+        contributes exactly zero to the gradient while costing a full forward and
+        backward. It still counts toward ``num_global_valid_tokens``, which is
+        computed before this filter, so the loss keeps the same denominator and the
+        resulting gradient is mathematically unchanged -- not bitwise, because the
+        surviving samples repack into different rows and float addition is not
+        associative.
+
+        Only worth enabling when zero-advantage samples are a large share of the
+        batch, i.e. with ``drop_zero_std_reward_groups=False``: with the drop on,
+        every group in the batch already has reward variance.
+        """
+
+        zero_advantage_tokens_in_loss_denominator: bool = True
+        """Count the tokens of zero-advantage samples in the loss denominator.
+
+        True (the default) normalizes the summed ``-advantage * ratio`` by every
+        valid token the batch consumed, which is what ``skip_zero_advantage_samples``
+        preserves. With ``drop_zero_std_reward_groups=False`` those tokens are often
+        half the batch or more, and their share moves step to step with how many
+        all-solved and all-failed groups land in it, so the gradient scale shrinks
+        and fluctuates with the data mix rather than with the learning signal.
+
+        False divides by the valid tokens of samples that carry a nonzero advantage
+        only, the tokens the gradient actually comes from. The effective step size
+        then no longer depends on the zero-variance share; expect it to be larger
+        than under the default by roughly 1 / (1 - zero-advantage token share).
+        Independent of ``skip_zero_advantage_samples``, which only decides whether
+        those samples are packed.
+        """
+
+        loss_aggregation: str = "token_mean"
+        """How the policy loss is averaged over the batch.
+
+        ``token_mean`` (default): one global pool, every trained token weighs the
+        same, so a group whose trajectories are 4x longer carries 4x the gradient.
+        ``prompt_mean`` (DAPO's objective, the ScaleRL setting): every rollout group
+        with a nonzero advantage weighs the same, and tokens weigh the same within
+        their group, so long-trajectory sources no longer outweigh short ones.
+
+        prompt_mean is applied by scaling each group's advantages by
+        ``D / (G * T_g)``, with ``D`` the loss denominator this batch is divided by,
+        ``G`` the number of groups with a nonzero advantage and ``T_g`` the group's
+        valid tokens on its nonzero-advantage samples; the summed
+        ``-advantage * ratio / D`` is then exactly the prompt mean. The scale is
+        positive, so the sign-based DPPO trust-region mask is unchanged. Advantage
+        metrics are computed before the batcher and read the unscaled values.
+        """
+
+        packing: str = "next_fit"
+        """How samples are assigned to ``seq_len`` rows. ``next_fit`` (default) keeps
+        arrival order; ``first_fit_decreasing`` sorts by length and fills the first
+        row with room, which leaves fewer padded rows (fewer microbatches). Only the
+        sample-to-row assignment changes; per-sample loss terms do not."""
+
+        spread_pad_token_ids: bool = False
+        """Fill each row's tail padding with varied token ids instead of repeating
+        ``pad_id``. An MoE router sends identical tokens to the same experts, so a
+        pad-only row (a batch with fewer real rows than DP ranks) floods one EP rank
+        and runs it out of memory. Pad positions carry no loss and sit in their own
+        segment, so real tokens are unaffected."""
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        num_groups_per_train_step: int,
+        dp_degree: int,
+        pad_id: int,
+        initial_policy_version: int,
+    ) -> None:
+        self.local_batch_size = config.batch.local_batch_size
+        self.seq_len = config.batch.seq_len
+        self.pad_id = pad_id
+        self._per_sample_pad_multiple = config.per_sample_pad_multiple
+        if config.packing not in ("next_fit", "first_fit_decreasing"):
+            raise ValueError(f"unknown packing {config.packing!r}")
+        self._packing = config.packing
+        self._spread_pad_token_ids = config.spread_pad_token_ids
+        self._skip_zero_advantage_samples = config.skip_zero_advantage_samples
+        self._zero_advantage_tokens_in_loss_denominator = (
+            config.zero_advantage_tokens_in_loss_denominator
+        )
+        if config.loss_aggregation not in _LOSS_AGGREGATIONS:
+            raise ValueError(
+                f"loss_aggregation must be one of {sorted(_LOSS_AGGREGATIONS)}, "
+                f"got {config.loss_aggregation!r}"
+            )
+        self._loss_aggregation = config.loss_aggregation
+        self._num_groups_per_train_step = num_groups_per_train_step
+        self._dp_degree = dp_degree
+        self._next_batch_policy_version = initial_policy_version
+        self._groups_for_next_batch: list[TrainingSampleGroup] = []
+
+    @property
+    def next_batch_policy_version(self) -> int:
+        """Policy version that will consume the group currently being accumulated."""
+        return self._next_batch_policy_version
+
+    def add_training_samples(
+        self, *, training_sample_group: TrainingSampleGroup
+    ) -> TrainingBatch | None:
+        """Add one rollout group and pack one train step once enough trainable groups are ready.
+
+        Args:
+            training_sample_group: One rollout group's trainable samples plus rollout metrics.
+
+        Example:
+            batcher = Batcher.Config().build(
+                num_groups_per_train_step=2,
+                dp_degree=1,
+                pad_id=0,
+                initial_policy_version=0,
+            )
+            batcher.add_training_samples(training_sample_group=group0)  # -> None
+            batcher.add_training_samples(training_sample_group=group1)  # -> TrainingBatch
+        """
+        self._groups_for_next_batch.append(training_sample_group)
+        num_trainable_groups = sum(
+            bool(group.training_samples) for group in self._groups_for_next_batch
+        )
+        if num_trainable_groups < self._num_groups_per_train_step:
+            return None  # accumulate until one full batch is ready
+        batch = self._pack_one_training_batch(
+            target_policy_version=self._next_batch_policy_version
+        )
+        self._next_batch_policy_version += 1
+        return batch
+
+    def _pack_one_training_batch(self, *, target_policy_version: int) -> TrainingBatch:
+        """Pack the oldest accumulated groups (up to `num_groups_per_train_step` trainable groups) into one batch."""
+        (
+            training_samples,
+            metrics,
+            num_rollout_groups,
+            num_metric_only_groups,
+            group_lineages,
+        ) = self._take_groups_for_train_step()
+        # The loss denominator counts every trained token the batch consumed, so it is
+        # taken before any compute-only filtering below. Equal to the loss_mask sum over
+        # the packed rows, since both per-sample and row padding mask out to False.
+        num_global_valid_tokens = sum(
+            sum(training_sample.loss_mask[1:]) for training_sample in training_samples
+        )
+        samples_to_pack = training_samples
+        if self._skip_zero_advantage_samples:
+            samples_to_pack = [
+                training_sample
+                for training_sample in training_samples
+                if any(training_sample.advantage[1:])
+            ]
+        # Valid tokens ACTUALLY packed (samples_to_pack drops zero-advantage samples
+        # when skip_zero_advantage_samples is on). Denominator for per-trained-token
+        # metrics so they are not diluted by the skipped tokens; the loss still uses
+        # num_global_valid_tokens for its scale.
+        num_packed_valid_tokens = sum(
+            sum(training_sample.loss_mask[1:]) for training_sample in samples_to_pack
+        )
+        num_nonzero_advantage_tokens = sum(
+            sum(training_sample.loss_mask[1:])
+            for training_sample in training_samples
+            if any(training_sample.advantage[1:])
+        )
+        num_loss_denominator_tokens = (
+            num_global_valid_tokens
+            if self._zero_advantage_tokens_in_loss_denominator
+            else num_nonzero_advantage_tokens
+        )
+        prompt_mean_metrics: list[m.Metric] = []
+        if self._loss_aggregation == "prompt_mean":
+            samples_to_pack, prompt_mean_metrics = self._scale_to_prompt_mean(
+                samples_to_pack, num_loss_denominator_tokens
+            )
+        # Next-fit all taken training_samples into rows.
+        rows = self._assign_training_samples_to_rows(samples_to_pack)
+        packed_rows = [self._pack_training_sample_row(row) for row in rows]
+        return TrainingBatch(
+            microbatches=self._build_microbatch_grid(packed_rows),
+            num_global_valid_tokens=num_global_valid_tokens,
+            num_loss_denominator_tokens=num_loss_denominator_tokens,
+            num_packed_valid_tokens=num_packed_valid_tokens,
+            metrics=[
+                *metrics,
+                *self._lineage_metrics(group_lineages),
+                *self._packing_metrics(
+                    packed_rows,
+                    samples_to_pack,
+                    num_rollout_groups,
+                    num_metric_only_groups,
+                ),
+                m.Metric(
+                    "train_batch/num_zero_advantage_samples_skipped",
+                    m.NoReduce(float(len(training_samples) - len(samples_to_pack))),
+                ),
+                *prompt_mean_metrics,
+                m.Metric(
+                    "train_batch/zero_advantage_token_frac",
+                    m.NoReduce(
+                        1.0
+                        - num_nonzero_advantage_tokens / max(num_global_valid_tokens, 1)
+                    ),
+                ),
+            ],
+            target_policy_version=target_policy_version,
+            # Trainer computes policy_age from these at consume time (faithful to what it trains on).
+            # min_policy_version is the oldest version this training_sample was sampled under.
+            min_policy_versions=[
+                training_sample.min_policy_version
+                for training_sample in training_samples
+            ],
+            group_lineages=group_lineages,
+        )
+
+    @staticmethod
+    def _lineage_metrics(
+        group_lineages: list[dict[str, object]],
+    ) -> list[m.Metric]:
+        """Small per-step aggregates for W&B; raw identities stay in JSONL."""
+        tasks = {lineage.get("task_id") for lineage in group_lineages}
+        sample_revisions = {
+            lineage.get("sample_revision") for lineage in group_lineages
+        }
+        mix_revisions = {lineage.get("mix_revision") for lineage in group_lineages}
+        epochs = [
+            int(lineage["dataset_epoch"])
+            for lineage in group_lineages
+            if isinstance(lineage.get("dataset_epoch"), int)
+        ]
+        positions = [
+            int(lineage["stream_position"])
+            for lineage in group_lineages
+            if isinstance(lineage.get("stream_position"), int)
+        ]
+        metrics = [
+            m.Metric("data_flow/train_groups", m.NoReduce(float(len(group_lineages)))),
+            m.Metric(
+                "data_flow/train_unique_tasks",
+                m.NoReduce(float(len(tasks - {None}))),
+            ),
+            m.Metric(
+                "data_flow/train_unique_sample_revisions",
+                m.NoReduce(float(len(sample_revisions - {None}))),
+            ),
+            m.Metric(
+                "data_flow/train_unique_mix_revisions",
+                m.NoReduce(float(len(mix_revisions - {None}))),
+            ),
+        ]
+        if epochs:
+            metrics.extend(
+                [
+                    m.Metric(
+                        "data_flow/train_dataset_epoch_min",
+                        m.NoReduce(float(min(epochs))),
+                    ),
+                    m.Metric(
+                        "data_flow/train_dataset_epoch_max",
+                        m.NoReduce(float(max(epochs))),
+                    ),
+                ]
+            )
+        if positions:
+            metrics.extend(
+                [
+                    m.Metric(
+                        "data_flow/train_stream_position_min",
+                        m.NoReduce(float(min(positions))),
+                    ),
+                    m.Metric(
+                        "data_flow/train_stream_position_max",
+                        m.NoReduce(float(max(positions))),
+                    ),
+                ]
+            )
+        return metrics
+
+    @staticmethod
+    def _scale_to_prompt_mean(
+        training_samples: list[TrainingSample], num_loss_denominator_tokens: int
+    ) -> tuple[list[TrainingSample], list[m.Metric]]:
+        """Rescale advantages so ``sum(-A * ratio) / D`` equals the prompt mean.
+
+        Groups are keyed by ``rollout_id.group_id``; a rollout that became several
+        training samples counts all of them. Only nonzero-advantage samples count
+        toward a group's tokens, and a group with none of them is left out of ``G``.
+        Returns new samples; the inputs are not mutated.
+        """
+        group_tokens: dict[int, int] = defaultdict(int)
+        for training_sample in training_samples:
+            if any(training_sample.advantage[1:]):
+                group_tokens[training_sample.rollout_id.group_id] += sum(
+                    training_sample.loss_mask[1:]
+                )
+        group_tokens = {g: t for g, t in group_tokens.items() if t > 0}
+        if not group_tokens or num_loss_denominator_tokens <= 0:
+            return training_samples, []
+        num_groups = len(group_tokens)
+        scales = {
+            group_id: num_loss_denominator_tokens / (num_groups * tokens)
+            for group_id, tokens in group_tokens.items()
+        }
+        scaled = [
+            dataclasses.replace(
+                training_sample,
+                advantage=[
+                    a * scales[training_sample.rollout_id.group_id]
+                    for a in training_sample.advantage
+                ],
+            )
+            if training_sample.rollout_id.group_id in scales
+            else training_sample
+            for training_sample in training_samples
+        ]
+        return scaled, [
+            m.Metric(
+                "train_batch/prompt_mean_num_groups", m.NoReduce(float(num_groups))
+            ),
+            m.Metric(
+                "train_batch/prompt_mean_scale_max",
+                m.NoReduce(max(scales.values())),
+            ),
+            m.Metric(
+                "train_batch/prompt_mean_scale_min",
+                m.NoReduce(min(scales.values())),
+            ),
+        ]
+
+    def _take_groups_for_train_step(
+        self,
+    ) -> tuple[
+        list[TrainingSample], list[m.Metric], int, int, list[dict[str, object]]
+    ]:
+        """Pop accumulated groups oldest-first until `num_groups_per_train_step` are taken."""
+        taken_training_samples: list[TrainingSample] = []
+        taken_metrics: list[m.Metric] = []
+        taken_group_lineages: list[dict[str, object]] = []
+        num_trainable_groups = 0
+        cut = 0
+        for group in self._groups_for_next_batch:
+            if num_trainable_groups >= self._num_groups_per_train_step:
+                break
+            cut += 1
+
+            taken_metrics.extend(group.metrics)
+            if group.training_samples:
+                num_trainable_groups += 1
+                taken_training_samples.extend(group.training_samples)
+                taken_group_lineages.append(
+                    dict(group.lineage) if group.lineage else {"group_id": group.group_id}
+                )
+
+        remaining_groups = self._groups_for_next_batch[cut:]
+        assert not remaining_groups, (
+            "Batcher packed more than one target policy version at once; "
+            "group freshness must be checked again for the next target"
+        )
+        self._groups_for_next_batch = []
+        num_metric_only_groups: int = cut - num_trainable_groups
+
+        return (
+            taken_training_samples,
+            taken_metrics,
+            num_trainable_groups,
+            num_metric_only_groups,
+            taken_group_lineages,
+        )
+
+    def _assign_training_samples_to_rows(
+        self, training_samples: list[TrainingSample]
+    ) -> list[list[TrainingSample]]:
+        """Next-fit training_samples into rows of <= ``seq_len`` tokens (the caller already capped the count).
+
+        Example:
+
+            # seq_len=10, training_sample effective lengths [5, 5, 5]
+            _assign_training_samples_to_rows([e5, e5, e5])  # -> [[e5, e5], [e5]]
+        """
+        if self._packing == "first_fit_decreasing":
+            return self._first_fit_decreasing(training_samples)
+        # TODO(async-rl): DP/CP/PP load balancing, or balancing tokens across DP rows
+        #   on a seq_len**2 budget.
+        rows: list[list[TrainingSample]] = []
+        current_row: list[TrainingSample] = []
+        current_len = 0
+        for training_sample in training_samples:
+            num_tokens_to_pack = self.num_tokens_to_pack(training_sample)
+
+            # doesn't fit, close the row
+            if current_row and current_len + num_tokens_to_pack > self.seq_len:
+                rows.append(current_row)
+                current_row, current_len = [], 0
+
+            current_row.append(training_sample)
+            current_len += num_tokens_to_pack
+
+        if current_row:
+            rows.append(current_row)
+
+        return rows
+
+    def _first_fit_decreasing(
+        self, training_samples: list[TrainingSample]
+    ) -> list[list[TrainingSample]]:
+        """Longest first, each into the first row it fits (stable for equal lengths).
+
+        Example:
+
+            # seq_len=10, lengths [3, 6, 4, 7]
+            _first_fit_decreasing(...)  # -> [[e7, e3], [e6, e4]]  (next-fit: 3 rows)
+        """
+        sized = sorted(
+            ((self.num_tokens_to_pack(s), i, s) for i, s in enumerate(training_samples)),
+            key=lambda x: (-x[0], x[1]),
+        )
+        rows: list[list[TrainingSample]] = []
+        row_lens: list[int] = []
+        for num_tokens, _, sample in sized:
+            for r, row_len in enumerate(row_lens):
+                if row_len + num_tokens <= self.seq_len:
+                    rows[r].append(sample)
+                    row_lens[r] += num_tokens
+                    break
+            else:
+                rows.append([sample])
+                row_lens.append(num_tokens)
+        return rows
+
+    def num_tokens_to_pack(self, training_sample: TrainingSample) -> int:
+        """Tokens this training_sample contributes to a packed row.
+
+        The loss-target split drops the last token (``input_ids = raw[:-1]``), and batch-invariant
+        mode rounds the length up to ``per_sample_pad_multiple``.
+
+        Example:
+
+            # token_ids of length 6, per_sample_pad_multiple=None  -> 5
+            # token_ids of length 6, per_sample_pad_multiple=8     -> 8
+        """
+        num_tokens = len(training_sample.token_ids) - 1
+        if self._per_sample_pad_multiple:
+            multiple = self._per_sample_pad_multiple
+            num_tokens = ((num_tokens + multiple - 1) // multiple) * multiple
+        return num_tokens
+
+    def _build_microbatch_grid(
+        self, packed_rows: list[dict]
+    ) -> list[list[TrainingMicrobatch]]:
+        """Build `[num_microbatches][dp_degree]` from however many rows packing produced (variable count).
+
+        Each (microbatch, rank) takes its rows round-robin. Pad-only rows are appended last, so dealing them round-robin
+        spreads them across microbatches/ranks instead of all landing on the last one.
+
+        Example:
+            # local_batch_size=2, dp_degree=2 -> 4 rows/microbatch; 5 real rows -> pad to 8 -> 2 microbatches.
+            # The 3 pad rows land on 3 different (microbatch, rank) pairs; none is all padding.
+        """
+        rows_per_microbatch = self.local_batch_size * self._dp_degree
+        num_microbatches = max(1, math.ceil(len(packed_rows) / rows_per_microbatch))
+
+        # Pad up to a full grid
+        while len(packed_rows) < num_microbatches * rows_per_microbatch:
+            packed_rows.append(self._pack_training_sample_row([]))
+
+        # [num_rows] -> [num_microbatches][dp_degree], dealing rows round-robin so padding spreads out
+        grid: list[list[TrainingMicrobatch]] = []
+        for microbatch in range(num_microbatches):
+            ranks: list[TrainingMicrobatch] = []
+            for rank in range(self._dp_degree):
+                start = microbatch * self._dp_degree + rank
+                # this (microbatch, rank)'s rows: every (num_microbatches * dp_degree)-th row from `start`
+                ranks.append(
+                    self.collate(
+                        packed_rows[start :: num_microbatches * self._dp_degree]
+                    )
+                )
+            grid.append(ranks)
+        return grid
+
+    # TODO(async-rl): make packing pluggable -- a `Packer` protocol on `Batcher.Config` (e.g. `TextPacker`)
+    #   so callers swap logic per modality (images, ...).
+    def _pack_training_sample_row(self, training_samples: list[TrainingSample]) -> dict:
+        """Concatenate one row's samples into a `[1, seq_len]` padded row.
+        - Labels and logits are shifted
+        -`positions` restart at 0 per sample
+        -`seq_lens` keeps per-sample lengths
+
+        Example:
+
+            # two 3-token samples [10, 11, 12] and [20, 21, 22], seq_len=8, pad_id=0
+            # each sample drops one token via the raw[:-1]/raw[1:] split (3 -> 2), then the row pads to 8:
+            input_ids = [10, 11, 20, 21, 0, 0, 0, 0]
+            labels    = [11, 12, 21, 22, 0, 0, 0, 0]
+            positions = [ 0,  1,  0,  1, 0, 0, 0, 0]   # restart at 0 per sample, then pad
+            seq_lens  = [2, 2]                         # per-sample lengths after the split (4 real tokens, 4 pad)
+        """
+        pad_values = {**_PAD_VALUES, "input_ids": self.pad_id, "labels": self.pad_id}
+        keys = list(pad_values)
+        row: dict[str, list] = {key: [] for key in keys}
+        positions: list[int] = []
+        seq_lens: list[int] = []
+
+        # Shift labals/logits + pad to per_sample_pad_multiple.
+        for training_sample in training_samples:
+            sample = {
+                "input_ids": training_sample.token_ids[:-1],
+                "labels": training_sample.token_ids[1:],
+                "generator_logprobs": training_sample.logprobs[1:],
+                "loss_mask": training_sample.loss_mask[1:],
+                "advantages": training_sample.advantage[1:],
+            }
+            sample_len = len(sample["input_ids"])
+            sample["policy_versions"] = [training_sample.max_policy_version] * sample_len
+
+            # pad to multiple
+            if self._per_sample_pad_multiple:
+                align = self._per_sample_pad_multiple
+                padded_len = ((sample_len + align - 1) // align) * align
+                for key in keys:
+                    sample[key] = sample[key] + [pad_values[key]] * (
+                        padded_len - sample_len
+                    )
+                sample_len = padded_len
+
+            # extend row
+            for key in keys:
+                row[key].extend(sample[key])
+            positions.extend(range(sample_len))
+            seq_lens.append(sample_len)
+
+        # Pad the row up to seq_len.
+        pad_len = self.seq_len - len(positions)
+        if pad_len > 0:
+            for key in keys:
+                row[key].extend([pad_values[key]] * pad_len)
+            if self._spread_pad_token_ids:
+                row["input_ids"][-pad_len:] = [i % 1024 for i in range(pad_len)]
+            positions.extend(range(pad_len))
+
+        # Stack lists into [1, L] tensors.
+        packed = {
+            key: torch.tensor(row[key], dtype=_DTYPES[key]).unsqueeze(0) for key in keys
+        }
+        packed["positions"] = torch.tensor(positions, dtype=torch.long).unsqueeze(0)
+        packed["seq_lens"] = seq_lens
+        topk = self._pack_topk_row(training_samples)
+        if topk is not None:
+            packed["topk_token_ids"] = topk.token_ids.unsqueeze(0)
+            packed["topk_logprobs"] = topk.logprobs.unsqueeze(0)
+        return packed
+
+    def _pack_topk_row(self, training_samples: list[TrainingSample]) -> SamplerTopK | None:
+        """The row's ``[seq_len, k]`` sampler top-k, laid out like the other fields
+        (shifted by one, per-sample and row padding as empty rows); None when no
+        sample in the row carries top-k."""
+        k = next((s.topk.k for s in training_samples if s.topk is not None), None)
+        if k is None:
+            return None
+        parts: list[SamplerTopK] = []
+        num_rows = 0
+        for training_sample in training_samples:
+            sample_len = len(training_sample.token_ids) - 1
+            if training_sample.topk is not None:
+                parts.append(
+                    SamplerTopK(
+                        token_ids=training_sample.topk.token_ids[1:],
+                        logprobs=training_sample.topk.logprobs[1:],
+                    )
+                )
+            else:
+                parts.append(SamplerTopK.empty_rows(sample_len, k))
+            if self._per_sample_pad_multiple:
+                align = self._per_sample_pad_multiple
+                padded_len = ((sample_len + align - 1) // align) * align
+                parts.append(SamplerTopK.empty_rows(padded_len - sample_len, k))
+                sample_len = padded_len
+            num_rows += sample_len
+        if self.seq_len > num_rows:
+            parts.append(SamplerTopK.empty_rows(self.seq_len - num_rows, k))
+        return SamplerTopK.cat(parts)
+
+    # TODO: accept a collate_fn on Batcher.Config (like the pre-trainer's
+    # dataloader) and wire a non-pretraining collate only when a caller actually
+    # needs one.
+    @staticmethod
+    def collate(rows: list[dict]) -> TrainingMicrobatch:
+        """Concatenate packed rows into a single ``[B, L]`` TrainingMicrobatch."""
+        topk_token_ids = topk_logprobs = None
+        topk_row = next((row for row in rows if "topk_token_ids" in row), None)
+        if topk_row is not None:
+            # Rows without top-k (pad-only rows) get empty rows of the same shape.
+            empty = SamplerTopK.empty_rows(*topk_row["topk_token_ids"].shape[1:])
+            topk_token_ids = torch.cat(
+                [row.get("topk_token_ids", empty.token_ids[None]) for row in rows]
+            )
+            topk_logprobs = torch.cat(
+                [row.get("topk_logprobs", empty.logprobs[None]) for row in rows]
+            )
+        return TrainingMicrobatch(
+            token_ids=torch.cat([row["input_ids"] for row in rows]),
+            labels=torch.cat([row["labels"] for row in rows]),
+            positions=torch.cat([row["positions"] for row in rows]),
+            generator_logprobs=torch.cat([row["generator_logprobs"] for row in rows]),
+            loss_mask=torch.cat([row["loss_mask"] for row in rows]),
+            advantages=torch.cat([row["advantages"] for row in rows]),
+            topk_token_ids=topk_token_ids,
+            topk_logprobs=topk_logprobs,
+            policy_versions=torch.cat([row["policy_versions"] for row in rows]),
+        )
+
+    def _packing_metrics(
+        self,
+        packed_rows: list[dict],
+        training_samples: list[TrainingSample],
+        num_rollout_groups: int,
+        num_metric_only_groups: int,
+    ) -> list[m.Metric]:
+        """Per-training-batch packing + count metrics. (policy age is logged at trainer consume time.)"""
+        total_slots = len(packed_rows) * self.seq_len
+        non_padded = sum(sum(row["seq_lens"]) for row in packed_rows)
+        return [
+            m.Metric(
+                "train_batch/padding_frac",
+                m.NoReduce((total_slots - non_padded) / total_slots),
+            ),
+            m.Metric(
+                "train_batch/num_microbatches",
+                m.NoReduce(
+                    float(len(packed_rows) // (self.local_batch_size * self._dp_degree))
+                ),
+            ),
+            m.Metric(
+                "train_batch/num_rollout_groups", m.NoReduce(float(num_rollout_groups))
+            ),
+            m.Metric(
+                "train_batch/num_metric_only_groups",
+                m.NoReduce(float(num_metric_only_groups)),
+            ),
+            m.Metric(
+                "train_batch/num_training_samples",
+                m.NoReduce(float(len(training_samples))),
+            ),
+        ]
