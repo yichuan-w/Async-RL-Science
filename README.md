@@ -11,8 +11,6 @@ top of SC and how the rollout buffer should be read:
 
 - a **state-level KL mask**, which drops positions where `KL(mu(.|s) || pi(.|s))`
   exceeds a threshold, in place of token-ratio masks (TIS / MIS);
-- an **age-scheduled KL penalty** `beta_a = beta_0 / sqrt(a)`, and the recipe that
-  combines the two;
 - **random sampling from the buffer** instead of oldest-first (greedy / FIFO), which
   lowers the mean batch age from 127 to about 52 for 4-7% more FLOPs.
 
@@ -32,7 +30,7 @@ python repro/plot_blog.py        # -> repro/figures/
 `plot_blog.py` prints the numbers quoted in the post next to the ones it recomputes.
 
 ![Figure 7](repro/figures/fig07_recipe.png)
-*The recipe (SC + KL penalty + KL mask) against TIS + SC, MIS + SC and DPPO, 128-step buffer: greedy take at lr 1e-2, random take at lr 1e-2, random take at lr 4e-2 (Figure 7 of the post).*
+*The recipe (SC + KL mask) against TIS + SC, MIS + SC and DPPO, 128-step buffer: greedy take at lr 1e-2, random take at lr 1e-2, random take at lr 4e-2 (Figure 7 of the post).*
 
 ![Figure 11](repro/figures/fig11_greedy_vs_random_time.png)
 *Greedy (oldest-first) vs random take from the same 128-step buffer, against training time (Figure 11).*
@@ -56,7 +54,7 @@ python repro/export_runs.py && python repro/compare_reruns.py --rerun outputs/re
 |---|---|
 | `torchtitan/experiments/rl/` | the async RL loop: vLLM samplers and a torchtitan trainer on separate GPUs, orchestrated with [Monarch](https://github.com/meta-pytorch/monarch), with weights synced through [TorchStore](https://github.com/meta-pytorch/torchstore) |
 | `torchtitan/experiments/rl/controller.py`, `components/work_buffer.py` | the rollout buffer: age cap `K` (`max_offpolicy_steps`), take order (`sample_order` = `fifo` / `random` / `lifo`), prefill, sampler sync interval |
-| `torchtitan/experiments/rl/losses/is_grid.py` | all objectives in the post: PG, TIS, MIS, DPPO and the rest of the SC paper's Table 1, score centering, KL penalty, KL mask (`NAMED_METHODS`) |
+| `torchtitan/experiments/rl/losses/is_grid.py` | all objectives in the post: PG, TIS, MIS, DPPO and the rest of the SC paper's Table 1, score centering, KL mask (`NAMED_METHODS`) |
 | `torchtitan/experiments/rl/examples/countdown/` | the Countdown environment, reward and every run configuration (`config_registry.py`) |
 | `repro/` | launcher, export, gradient-by-age measurement, figure scripts, released data |
 

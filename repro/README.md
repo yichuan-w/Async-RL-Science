@@ -82,7 +82,7 @@ SGD, 1,200 steps, and one seed unless listed.
 | 7, 8 col 2 | `async128randnp` | `sc_klreg_kl03` (recipe), `sc_klreg tis_sc mis_sc dppo` |
 | 7, 8 col 3 | `async128randnplr4 async128randnplr4s1 async128randnplr4s2` | `sc_klreg_kl01` (recipe), `sc_klreg` (3 seeds); `tis_sc` (seeds 0 and 2); `mis_sc dppo` (seed 0) |
 | 10 | `stale async128np async128lifonp async128randnp` | `sc_klreg` |
-| 11 | `async128np async128randnp` | `sc_klreg_kl03` (SC + KL penalty + KL mask), `tis_sc mis_sc dppo` |
+| 11 | `async128np async128randnp` | `sc_klreg_kl03` (recipe, SC + KL mask), `tis_sc mis_sc dppo` |
 
 Method names (`torchtitan/experiments/rl/losses/is_grid.py`, `NAMED_METHODS`):
 

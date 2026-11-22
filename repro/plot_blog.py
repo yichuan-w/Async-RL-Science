@@ -50,7 +50,7 @@ COLORS = {
     "drift": "#e87ba4",
 }
 LABELS = {
-    "recipe": "Recipe (SC + KL penalty + KL mask)",
+    "recipe": "Recipe (SC + KL mask)",
     "sc_klreg": "SC + KL penalty",
     "sc_kl03": "SC + KL mask 0.3",
     "sc_kl01": "SC + KL mask 0.1",
@@ -467,7 +467,7 @@ def fig10(runs, grads, out):
 
 def fig11(runs, grads, out):
     """Greedy vs random take from a 128-step buffer, against training time."""
-    # (run method, style key): the first panel is the recipe, SC + KL penalty + KL mask 0.3.
+    # (run method, style key): the first panel is the recipe, SC + KL mask 0.3.
     methods = (("sc_klreg_kl03", "recipe"), ("tis_sc", "tis_sc"), ("mis_sc", "mis_sc"), ("dppo", "dppo"))
     fig, ax = plt.subplots(2, 4, figsize=(18, 7), dpi=130, sharey="row")
     for j, (m, key) in enumerate(methods):
@@ -489,7 +489,7 @@ def fig11(runs, grads, out):
             print(
                 f"  {v}/{m}: {h[-1]:.2f} h for {int(steps[-1])} steps, last-50 {fmt(runs.last50(v, m, 1200))}"
             )
-        ax[0, j].set_title("SC + KL penalty + KL mask" if key == "recipe" else LABELS[key])
+        ax[0, j].set_title("SC + KL mask" if key == "recipe" else LABELS[key])
         ax[0, j].legend(frameon=False, fontsize=8)
     ax[0, 0].set_ylabel("training accuracy")
     ax[1, 0].set_ylabel("validation accuracy")
